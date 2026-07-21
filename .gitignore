@@ -50,3 +50,6 @@ pretrained_models/*
 *_pb2_grpc.py
 *_pb2.py
 *.tar
+
+# Local dataset quality-control reports may contain transcripts and NAS paths.
+reports/

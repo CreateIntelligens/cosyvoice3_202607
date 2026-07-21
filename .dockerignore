@@ -1,0 +1,32 @@
+.git
+.github
+.pytest_cache
+.ruff_cache
+**/__pycache__
+**/*.pyc
+**/*.pyo
+
+# Runtime artifacts must be mounted, not baked into the image.
+/data
+/exp
+/pretrained_models
+/reports
+/tensorboard
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.tar
+*.parquet
+*.wav
+*.flac
+*.mp3
+*.m4a
+
+# Editor and local environment files.
+.idea
+.vscode
+.venv
+venv
+*.swp
+*~

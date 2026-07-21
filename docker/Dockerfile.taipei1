@@ -1,0 +1,87 @@
+# syntax=docker/dockerfile:1.7
+# One image for CosyVoice3 preprocessing, DDP/DeepSpeed training and Python inference.
+FROM nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04 AS dependencies
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    VIRTUAL_ENV=/opt/cosyvoice-venv \
+    PATH=/opt/cosyvoice-venv/bin:${PATH} \
+    PYTHONPATH=/opt/CosyVoice:/opt/CosyVoice/third_party/Matcha-TTS \
+    XDG_CACHE_HOME=/tmp/cosyvoice-cache \
+    HF_HOME=/tmp/cosyvoice-cache/huggingface \
+    TORCH_EXTENSIONS_DIR=/tmp/cosyvoice-cache/torch_extensions \
+    NCCL_DEBUG=WARN
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3.10 \
+        python3.10-dev \
+        python3.10-venv \
+        python3-pip \
+        build-essential \
+        cmake \
+        ninja-build \
+        pkg-config \
+        git \
+        git-lfs \
+        openssh-client \
+        ca-certificates \
+        curl \
+        wget \
+        unzip \
+        ffmpeg \
+        sox \
+        libsox-dev \
+        libsndfile1 \
+        libsndfile1-dev \
+        libgomp1 \
+        libgl1 \
+        libglib2.0-0 \
+        numactl \
+        zstd \
+    && rm -rf /var/lib/apt/lists/* \
+    && python3.10 -m venv "${VIRTUAL_ENV}" \
+    && "${VIRTUAL_ENV}/bin/python" -m pip install --upgrade \
+        pip setuptools==80.9.0 wheel
+
+# Install the large dependency layer before source COPY so normal code changes reuse it.
+COPY requirements.txt /tmp/cosyvoice-requirements.txt
+RUN python -m pip install \
+        --index-url https://download.pytorch.org/whl/cu121 \
+        torch==2.3.1 torchaudio==2.3.1
+RUN python -m pip install \
+        setuptools==80.9.0 cython==0.29.36 numpy==1.26.4 pynini==2.1.5
+RUN python -m pip install --no-build-isolation \
+        openai-whisper==20231117 pyworld==0.3.4
+RUN python -m pip install \
+        -r /tmp/cosyvoice-requirements.txt
+
+FROM dependencies AS runtime
+
+ARG SOURCE_COMMIT=unknown
+ARG SOURCE_DIRTY=unknown
+LABEL org.opencontainers.image.title="CosyVoice3 Taipei-1 training and inference" \
+      org.opencontainers.image.source="https://github.com/FunAudioLLM/CosyVoice" \
+      org.opencontainers.image.revision="${SOURCE_COMMIT}" \
+      io.cosyvoice.source-dirty="${SOURCE_DIRTY}"
+
+WORKDIR /opt/CosyVoice
+COPY . /opt/CosyVoice
+
+# Fail during build instead of failing on Taipei-1 because a submodule was absent.
+RUN test -f /opt/CosyVoice/third_party/Matcha-TTS/matcha/__init__.py \
+    && ffmpeg -version >/dev/null \
+    && sox --version >/dev/null \
+    && python /opt/CosyVoice/tools/container_smoke_test.py --cpu-only
+
+# Pyxis/Enroot commonly ignores OCI ENTRYPOINT, so correctness must not depend on one.
+RUN mkdir -p /workspace /tmp/cosyvoice-cache \
+    && chmod 1777 /workspace /tmp/cosyvoice-cache
+
+WORKDIR /opt/CosyVoice
+CMD ["/bin/bash"]
