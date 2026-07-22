@@ -25,6 +25,7 @@ import torch
 
 def job(utt_list, parquet_file, utt2parquet_file, spk2parquet_file):
     start_time = time.time()
+    spk_list = [utt2spk[utt] for utt in utt_list]
     data_list = []
     for utt in tqdm(utt_list):
         data = open(utt2wav[utt], 'rb').read()
@@ -104,7 +105,9 @@ if __name__ == "__main__":
     utts = list(utt2wav.keys())
 
     # Using process pool to speedup
+    os.makedirs(args.des_dir, exist_ok=True)
     pool = multiprocessing.Pool(processes=args.num_processes)
+    results = []
     parquet_list, utt2parquet_list, spk2parquet_list = [], [], []
     for i, j in enumerate(range(0, len(utts), args.num_utts_per_parquet)):
         parquet_file = os.path.join(args.des_dir, 'parquet_{:09d}.tar'.format(i))
@@ -113,8 +116,13 @@ if __name__ == "__main__":
         parquet_list.append(parquet_file)
         utt2parquet_list.append(utt2parquet_file)
         spk2parquet_list.append(spk2parquet_file)
-        pool.apply_async(job, (utts[j: j + args.num_utts_per_parquet], parquet_file, utt2parquet_file, spk2parquet_file))
+        results.append(pool.apply_async(job, (utts[j: j + args.num_utts_per_parquet], parquet_file,
+                                               utt2parquet_file, spk2parquet_file)))
     pool.close()
+    # Propagate worker failures instead of silently writing data.list entries for
+    # missing or incomplete parquet shards.
+    for result in results:
+        result.get()
     pool.join()
 
     with open('{}/data.list'.format(args.des_dir), 'w', encoding='utf8') as f1, \

@@ -132,6 +132,8 @@ def init_optimizer_and_scheduler(args, configs, model, gan):
         # use deepspeed optimizer for speedup
         if args.train_engine == "deepspeed":
             def scheduler(opt):
+                if scheduler_type is ConstantLR:
+                    return ConstantLR(opt)
                 return scheduler_type(opt, **configs['train_conf']['scheduler_conf'])
             model, optimizer, _, scheduler = deepspeed.initialize(
                 args=args,

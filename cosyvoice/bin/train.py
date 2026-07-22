@@ -135,7 +135,20 @@ def main():
     if args.checkpoint is not None:
         if os.path.exists(args.checkpoint):
             state_dict = torch.load(args.checkpoint, map_location='cpu')
-            model.load_state_dict(state_dict, strict=False)
+            incompatible = model.load_state_dict(state_dict, strict=False)
+            if gan is True:
+                missing_generator = sorted(
+                    key for key in incompatible.missing_keys
+                    if key.startswith('generator.')
+                )
+                generator_keys = [key for key in model.state_dict() if key.startswith('generator.')]
+                loaded_generator = len(generator_keys) - len(missing_generator)
+                logging.info('HiFi-GAN generator checkpoint coverage: %d/%d', loaded_generator, len(generator_keys))
+                if missing_generator:
+                    raise RuntimeError(
+                        'HiFi-GAN checkpoint did not fully initialize the generator; '
+                        'convert official hift.pt to generator.* wrapper keys first. '
+                        'Missing keys (first 10): {}'.format(missing_generator[:10]))
             if 'step' in state_dict:
                 start_step = state_dict['step']
             if 'epoch' in state_dict:

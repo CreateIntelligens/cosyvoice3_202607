@@ -1,5 +1,9 @@
 # CosyVoice3 通用臺灣台語 TTS：資料、容器與 Taipei-1 訓練手冊
 
+本文件說明設計判斷、資料策略、模型階段與 HiFT 風險。要直接照命令從 image、資料、smoke、H100 訓練一路做到推論，使用 [taigi-training-runbook.md](taigi-training-runbook.md)；實際資料產物與 QC 流程見 [taigi-data-preparation.md](taigi-data-preparation.md)。
+
+---
+
 ## 0. 目標與結論
 
 本計畫的使用介面只接收華語中文，輸出臺灣台語語音。現有原始資料為：
@@ -357,13 +361,17 @@ docker run --rm --gpus all REGISTRY/cosyvoice3-taigi:COMMIT \
 
 ### 8.3 掛載規劃
 
-容器內固定使用：
+容器外 host path 可依平台不同，容器內固定使用：
 
 ```text
-/workspace/project       程式與設定
-/workspace/models        官方模型與輸出 checkpoint
-/workspace/data          Parquet 或切段後語音
-/workspace/exp           checkpoint、TensorBoard、log
+/opt/CosyVoice           image 內固定程式
+/workspace               外部 experiment root，可寫
+/workspace/models        官方模型
+/workspace/prepared      manifest、特徵與 Parquet
+/workspace/exp           checkpoint
+/workspace/tensorboard   log
+/datasets                外部原始資料，唯讀
+/qc                      外部 QC JSON，唯讀
 ```
 
 Taipei-1 實際啟動命令可能是 Slurm + Pyxis/Enroot，也可能由平台 wrapper 提交。以下只是結構示意，不可在未知平台參數下原樣提交：
@@ -371,9 +379,12 @@ Taipei-1 實際啟動命令可能是 Slurm + Pyxis/Enroot，也可能由平台 w
 ```bash
 srun <Taipei-1 allocation options> \
   --container-image=REGISTRY/cosyvoice3-taigi:COMMIT \
-  --container-mounts=HOST_PROJECT:/workspace/project,HOST_DATA:/workspace/data,HOST_MODELS:/workspace/models,HOST_EXP:/workspace/exp \
-  bash /workspace/project/jobs/train_llm.sh
+  --container-mounts=HOST_WORKSPACE:/workspace,HOST_DATASETS:/datasets:ro,HOST_QC:/qc:ro \
+  --container-workdir=/opt/CosyVoice \
+  python /opt/CosyVoice/tools/container_smoke_test.py
 ```
+
+manifest 一律保存 `/workspace` 或 `/datasets` 的容器內路徑，不保存 host 實體路徑。單一 root、分離掛載、`MATERIALIZE` 與權限規則見完整 runbook 第 2 節。
 
 需要向 Taipei-1 管理者確認：registry 登入、image size 上限、共享檔案系統、節點網路、每節點 8 張 H100 的可見方式、NCCL/InfiniBand 設定、作業最長時間、checkpoint 保留與 job requeue。
 
@@ -398,21 +409,21 @@ snapshot_download(
 
 ```bash
 python /opt/CosyVoice/tools/extract_embedding.py \
-  --dir /workspace/data/taigi_train \
+  --dir /workspace/prepared/data/train \
   --onnx_path /workspace/models/Fun-CosyVoice3-0.5B/campplus.onnx \
   --num_thread 16
 
 python /opt/CosyVoice/tools/extract_speech_token.py \
-  --dir /workspace/data/taigi_train \
+  --dir /workspace/prepared/data/train \
   --onnx_path /workspace/models/Fun-CosyVoice3-0.5B/speech_tokenizer_v3.onnx \
   --num_thread 16
 
-mkdir -p /workspace/data/taigi_train/parquet
+mkdir -p /workspace/prepared/data/train/parquet
 python /opt/CosyVoice/tools/make_parquet_list.py \
   --num_utts_per_parquet 1000 \
   --num_processes 16 \
-  --src_dir /workspace/data/taigi_train \
-  --des_dir /workspace/data/taigi_train/parquet
+  --src_dir /workspace/prepared/data/train \
+  --des_dir /workspace/prepared/data/train/parquet
 ```
 
 預先抽 token 能降低多 GPU training 時重複執行 ONNX 的負擔。完成後抽查 Parquet 欄位、音訊、文字、speaker embedding 和 speech token 非空。
@@ -461,9 +472,9 @@ train_conf:
 torchrun --standalone --nnodes=1 --nproc_per_node="$NUM_GPUS" \
   /opt/CosyVoice/cosyvoice/bin/train.py \
   --train_engine torch_ddp \
-  --config /workspace/project/conf/taigi_cosyvoice3.yaml \
-  --train_data /workspace/data/taigi_zh2taigi_train.data.list \
-  --cv_data /workspace/data/taigi_zh2taigi_dev.data.list \
+  --config /workspace/conf/taigi_cosyvoice3.yaml \
+  --train_data /workspace/prepared/data/train/parquet/data.list \
+  --cv_data /workspace/prepared/data/dev/parquet/data.list \
   --qwen_pretrain_path /workspace/models/Fun-CosyVoice3-0.5B/CosyVoice-BlankEN \
   --onnx_path /workspace/models/Fun-CosyVoice3-0.5B \
   --model llm \
@@ -485,9 +496,9 @@ Flow 學習 speech token、speaker embedding 到 mel。若 LLM 輸出的內容�
 torchrun --standalone --nnodes=1 --nproc_per_node="$NUM_GPUS" \
   /opt/CosyVoice/cosyvoice/bin/train.py \
   --train_engine torch_ddp \
-  --config /workspace/project/conf/taigi_cosyvoice3.yaml \
-  --train_data /workspace/data/taigi_audio_train.data.list \
-  --cv_data /workspace/data/taigi_audio_dev.data.list \
+  --config /workspace/conf/taigi_cosyvoice3.yaml \
+  --train_data /workspace/prepared/data/train/parquet/data.list \
+  --cv_data /workspace/prepared/data/dev/parquet/data.list \
   --qwen_pretrain_path /workspace/models/Fun-CosyVoice3-0.5B/CosyVoice-BlankEN \
   --onnx_path /workspace/models/Fun-CosyVoice3-0.5B \
   --model flow \
@@ -519,7 +530,11 @@ python /opt/CosyVoice/cosyvoice/bin/average_model.py \
 
 CosyVoice3 程式確實包含可訓練的 `CausalHiFTGenerator`、多週期／多解析度 discriminator、mel reconstruction、feature matching、F0 和 TPR loss，因此「程式上可以訓練」。但官方 recipe 的 HiFi-GAN 路徑不夠完整，不能把 `run.sh` 原樣執行後期待安全的 SFT。
 
-對本計畫而言，第一版應保留官方 `hift.pt`，原因是：
+結論是：**把 HiFT fine-tuning 排進正式實驗內容，但不把它設成正式模型的必經依賴。** 先凍結官方 `hift.pt` 作為 baseline，再從該權重微調一個 candidate；只有 candidate 通過 A/B gate 才替換。這正是「先實際訓練，效果不好就改回官方」的可重現版本，且任何時候都不覆蓋 baseline。
+
+官方證據並不支持「一定要訓練 vocoder」：CosyVoice3 的 [LibriTTS recipe](https://github.com/FunAudioLLM/CosyVoice/blob/main/examples/libritts/cosyvoice3/run.sh) 雖把 `hifigan` 放在迴圈內，同一段仍標示目前只支援 LLM training；官方協作者也在 [issue #1349](https://github.com/FunAudioLLM/CosyVoice/issues/1349) 回覆通常不需要訓練 HiFi-GAN。因此這裡將它列為有明確放行條件的 domain-adaptation 實驗，而不是預設一定比官方模型好。
+
+保留官方 baseline 的原因是：
 
 - Vocoder 大致語言無關；臺灣台語適配的主要收益通常先來自 LLM 和 flow。
 - 官方 vocoder 已見過大規模、多語言資料，遠多於這批經過降噪的戲劇音訊。
@@ -540,7 +555,7 @@ CosyVoice3 程式確實包含可訓練的 `CausalHiFTGenerator`、多週期／�
 --checkpoint $pretrained_model_dir/$model.pt
 ```
 
-當 `$model` 是 `hifigan` 時，它尋找 `hifigan.pt`；官方推論模型通常提供的是 `hift.pt`。找不到時，`train.py` 只記 warning，訓練仍繼續，GAN generator 可能從隨機初始化開始。
+當 `$model` 是 `hifigan` 時，它尋找 `hifigan.pt`；官方推論模型通常提供的是 `hift.pt`。上游 `train.py` 找不到 checkpoint 時只記 warning，訓練仍繼續，GAN generator 可能從隨機初始化開始；本 repo 已另外加入 generator 100% coverage 防呆。
 
 此外，訓練物件是 wrapper：
 
@@ -553,17 +568,15 @@ discriminator.*
 
 ### 12.3 正確建立 GAN 初始 checkpoint
 
-從官方 `hift.pt` 加上 `generator.` prefix：
+使用 repo 內工具從官方 `hift.pt` 建立另一個 wrapper checkpoint；工具會拒絕原地覆寫：
 
-```python
-import torch
-
-src = torch.load("/workspace/models/Fun-CosyVoice3-0.5B/hift.pt", map_location="cpu")
-dst = {f"generator.{key}": value for key, value in src.items()}
-torch.save(dst, "/workspace/models/Fun-CosyVoice3-0.5B/hifigan_init.pt")
+```bash
+python /opt/CosyVoice/tools/convert_hift_checkpoint.py wrap \
+  /workspace/models/Fun-CosyVoice3-0.5B/hift.pt \
+  /workspace/exp/taigi/hifigan_init.pt
 ```
 
-必須增加載入驗證：比較 `hifigan_init.pt` 的 `generator.*` keys 與 `configs['hifigan'].generator.state_dict()`，確認 generator 參數 100% 覆蓋；discriminator 隨機初始化是預期行為。不要只看 `load_state_dict(strict=False)` 沒有 exception。
+本 repo 的 `train.py` 已在 `--model hifigan` 時強制檢查 generator key coverage 為 100%；裸 `hift.pt`、錯誤 wrapper 或不相容架構會直接停止，discriminator 隨機初始化則是預期行為。
 
 ### 12.4 若要做實驗，使用保守設定
 
@@ -595,13 +608,13 @@ train_conf_gan:
 torchrun --standalone --nnodes=1 --nproc_per_node="$NUM_GPUS" \
   /opt/CosyVoice/cosyvoice/bin/train.py \
   --train_engine torch_ddp \
-  --config /workspace/project/conf/taigi_cosyvoice3.yaml \
-  --train_data /workspace/data/taigi_hifigan_train.data.list \
-  --cv_data /workspace/data/taigi_hifigan_dev.data.list \
+  --config /workspace/conf/taigi_cosyvoice3.yaml \
+  --train_data /workspace/prepared/data/train/parquet/data.list \
+  --cv_data /workspace/prepared/data/dev/parquet/data.list \
   --qwen_pretrain_path /workspace/models/Fun-CosyVoice3-0.5B/CosyVoice-BlankEN \
   --onnx_path /workspace/models/Fun-CosyVoice3-0.5B \
   --model hifigan \
-  --checkpoint /workspace/models/Fun-CosyVoice3-0.5B/hifigan_init.pt \
+  --checkpoint /workspace/exp/taigi/hifigan_init.pt \
   --model_dir /workspace/exp/taigi/hifigan \
   --tensorboard_dir /workspace/exp/taigi/tensorboard/hifigan \
   --ddp.dist_backend nccl \
@@ -614,17 +627,10 @@ GAN 第一輪不要加 `--use_amp`，先用 FP32 排除 adversarial loss、F0 �
 
 訓練 checkpoint 同時包含 generator 和 discriminator；推論的 `hift.pt` 只能保存 generator。不要直接把完整 `hifigan.pt` 改名成 `hift.pt`。
 
-```python
-import torch
-
-src = torch.load("/workspace/exp/taigi/hifigan/epoch_N_whole.pt", map_location="cpu")
-dst = {
-    key.removeprefix("generator."): value
-    for key, value in src.items()
-    if key.startswith("generator.")
-}
-assert dst, "No generator weights found"
-torch.save(dst, "/workspace/exp/taigi/hift.pt")
+```bash
+python /opt/CosyVoice/tools/convert_hift_checkpoint.py extract \
+  /workspace/exp/taigi/hifigan/epoch_N_whole.pt \
+  /workspace/exp/taigi/hifigan_candidate_hift.pt
 ```
 
 再以 `strict=True` 載入 `CausalHiFTGenerator` 做驗證。固定用 ground-truth mel → vocoder output 比較官方與微調版；如果這一步已經有爆音、金屬音或 F0 異常，問題在 vocoder，不要用完整 TTS 掩蓋它。
@@ -633,12 +639,16 @@ torch.save(dst, "/workspace/exp/taigi/hift.pt")
 
 只有同時滿足以下條件才採用微調 HiFT：
 
-- Ground-truth mel reconstruction 的 MOS 明顯優於官方 `hift.pt`。
+- 先用固定的 ground-truth mel／F0 做 vocoder-only A/B，candidate 的盲聽 MOS 或偏好率明顯優於官方 `hift.pt`。
 - 沒有爆音、音量抽動、高頻金屬音或 F0 跳動。
-- Seen/unseen speakers 都不退化。
+- Seen speakers、未見 speakers、男／女聲、低／高音域都不退化。
 - 不只在降噪戲劇音軌上變好，乾淨外部測試音也沒有明顯退化。
+- 再用同一組 LLM/flow 做 end-to-end A/B；只改 `hift.pt`，不能同時換其他 checkpoint。
+- 自動檢查至少包含 clipping rate、RMS/LUFS、長靜音比例、F0 異常與 ASR CER；最終仍需盲聽，不能只看 GAN validation loss。
 
-否則部署官方 `hift.pt`。只訓 LLM 和 flow、沿用官方 vocoder 是完全合理且通常更安全的方案。
+實驗順序是 `官方 hift baseline → 10–20 小時 A 級資料短跑 → vocoder-only gate → 全量 candidate（必要時）→ end-to-end gate → 採用或回退`。HiFT 訓練在計畫表上排在 LLM/flow 之後方便做最終 A/B，但技術上它直接使用真實音訊、mel 與 F0，不依賴先完成 LLM/flow。
+
+任一 gate 未通過就部署原封不動的官方 `hift.pt`。只訓 LLM 和 flow、沿用官方 vocoder 是官方意見也支持的正常結果，不算訓練失敗。
 
 ---
 
@@ -669,7 +679,7 @@ instruction = "You are a helpful assistant. 請將輸入的華語翻譯成自然
 for index, result in enumerate(model.inference_instruct2(
     "明天早上九點，我們一起去市場買東西。",
     instruction,
-    "/workspace/data/prompts/taigi_speaker.wav",
+    "/workspace/eval/taigi_speaker.wav",
     stream=False,
     text_frontend=False,
 )):
@@ -764,13 +774,15 @@ fixed evaluation outputs
 
 ## 17. 目前 repository 已知注意事項
 
-- 本機 checkout 的 `third_party/Matcha-TTS` submodule 尚未初始化；image build 前必須處理。
+- 本機 `third_party/Matcha-TTS` 已初始化；每次 image build 前仍必須以 `git submodule status` 與檔案測試確認。
 - repository 內沒有預訓練模型，應在共享模型目錄另外準備。
 - `examples/libritts/cosyvoice3/run.sh` 預設 `stop_stage=3`，不會進入 training stage 5。
 - script 訊息說目前只支援 LLM training，卻又迴圈執行 `llm flow hifigan`；應分開提交三個明確作業，不使用原迴圈。
 - embedding/token extraction 的部分相對路徑與執行工作目錄容易不一致，容器作業一律使用 `/opt/CosyVoice/...` 絕對路徑。
 - averaging 區段的 `exp/cosyvoice` 路徑和 CosyVoice3 training output 不一致。
-- DeepSpeed 範例的 optimizer learning rate 是 `0.001`，不適合直接當 SFT 的 `1e-5` 使用。先用 DDP；要用 DeepSpeed 時另外建立並審核設定。
+- 官方 DeepSpeed 範例的 optimizer learning rate 是 `0.001`；本 repo 的 CPU-offload smoke 設定已改為 `1e-5`，正式值仍須由 dev 與生成品質決定。
+- DeepSpeed ZeRO-2 CPU offload 已完成一個 smoke epoch，但目前 `train.py --checkpoint` 仍不能直接載入目錄式 DeepSpeed checkpoint 續接 optimizer state；易被 preempt 的正式作業優先使用 DDP。
+- DeepSpeed + `ConstantLR` 的建構參數錯誤已在本 repo 修正；舊 image 若沒有重建仍會載入舊程式。
 - HiFi-GAN checkpoint 的 `hift.pt`、`hifigan.pt` 與 `generator.*` key 格式不可混用。
 
 ## 參考資料

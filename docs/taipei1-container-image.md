@@ -1,5 +1,7 @@
 # CosyVoice3：Taipei-1 訓練與推論 Image
 
+本文件聚焦 image 建置與交付。資料、smoke、正式 H100 訓練、checkpoint 與推論的逐步流程見 [taigi-training-runbook.md](taigi-training-runbook.md)。
+
 本專案提供單一 OCI/Docker image，同時支援資料前處理、PyTorch DDP／DeepSpeed 訓練，以及 Python、WebUI、FastAPI／gRPC 推論。建置當下的專案程式與 Matcha-TTS 會放在 `/opt/CosyVoice`，執行時不需要 `conda` 或 `conda activate`。
 
 ## 1. Image 邊界
@@ -14,10 +16,14 @@ Image 包含：
 Image 不包含原始 WAV、manifest、Parquet、官方模型、自訓 checkpoint、optimizer state 或 log。它們會頻繁更新且可能非常大，應放在 Taipei-1 共享儲存並掛載：
 
 ```text
-/opt/CosyVoice       image 內程式碼
-/workspace/models    官方模型及推論模型
-/workspace/data      manifest、Parquet、測試 WAV
-/workspace/exp       checkpoint、optimizer state、TensorBoard、log
+/opt/CosyVoice           image 內程式碼
+/workspace               外部 experiment root
+/workspace/models        官方模型及推論模型
+/workspace/prepared      manifest、特徵、Parquet、測試 WAV
+/workspace/conf          正式實驗設定
+/workspace/exp           checkpoint、optimizer state
+/workspace/tensorboard   log
+/workspace/run-metadata  image/data/config/launch provenance
 ```
 
 正式作業不應另外掛載本機 repository 覆蓋 `/opt/CosyVoice`，否則 image digest 無法代表實際執行的程式。
@@ -88,27 +94,25 @@ LLM 範例：
 
 ```bash
 docker run --rm --gpus all --ipc=host --shm-size=32g \
-  -v /HOST/models/Fun-CosyVoice3-0.5B-2512:/workspace/models/base:ro \
-  -v /HOST/data/taigi:/workspace/data:ro \
-  -v /HOST/exp/cosyvoice3-taigi:/workspace/exp \
+  -v /HOST/taigi_v1:/workspace \
   IMAGE \
   torchrun --standalone --nnodes=1 --nproc_per_node=8 \
     /opt/CosyVoice/cosyvoice/bin/train.py \
     --train_engine torch_ddp \
     --model llm \
-    --config /opt/CosyVoice/examples/libritts/cosyvoice3/conf/cosyvoice3.yaml \
-    --train_data /workspace/data/train.data.list \
-    --cv_data /workspace/data/dev.data.list \
-    --qwen_pretrain_path /workspace/models/base/CosyVoice-BlankEN \
-    --onnx_path /workspace/models/base \
-    --checkpoint /workspace/models/base/llm.pt \
+    --config /workspace/conf/taigi_cosyvoice3_v1.yaml \
+    --train_data /workspace/prepared/data/train/parquet/data.list \
+    --cv_data /workspace/prepared/data/dev/parquet/data.list \
+    --qwen_pretrain_path /workspace/models/Fun-CosyVoice3-0.5B/CosyVoice-BlankEN \
+    --onnx_path /workspace/models/Fun-CosyVoice3-0.5B \
+    --checkpoint /workspace/models/Fun-CosyVoice3-0.5B/llm.pt \
     --model_dir /workspace/exp/llm \
-    --tensorboard_dir /workspace/exp/tensorboard/llm \
+    --tensorboard_dir /workspace/tensorboard/llm \
     --ddp.dist_backend nccl \
     --num_workers 4 --prefetch 100 --pin_memory --use_amp
 ```
 
-flow 改為 `--model flow`、`--checkpoint /workspace/models/base/flow.pt` 與獨立輸出目錄。HiFi-GAN 不可把 `hift.pt` 直接改名後傳入；仍依主訓練文件的 wrapper checkpoint 轉換流程處理。
+flow 改為 `--model flow`、`--checkpoint /workspace/models/Fun-CosyVoice3-0.5B/flow.pt` 與獨立輸出目錄。HiFi-GAN 不可把 `hift.pt` 直接改名後傳入；仍依主訓練文件的 wrapper checkpoint 轉換流程處理。
 
 ## 5. 推論
 
@@ -148,16 +152,21 @@ apptainer pull cosyvoice3-taigi.sif docker://REGISTRY/PROJECT/IMAGE:TAG
 
 Apptainer 支援直接從 Docker/OCI registry 建立 SIF。[Apptainer pull 文件](https://apptainer.org/docs/user/main/cli/apptainer_pull.html)
 
-若平台使用 Pyxis，結構如下；實際 allocation 與 mount 參數必須依 Taipei-1 配發文件：
+Taipei-1 官方使用 Slurm + Pyxis + Enroot。建議先在 compute allocation 將 Docker Hub image 固定成 `.sqsh`：
 
 ```bash
-srun <allocation-options> \
-  --container-image=REGISTRY/PROJECT/IMAGE:TAG \
-  --container-mounts=/HOST/models:/workspace/models,/HOST/data:/workspace/data,/HOST/exp:/workspace/exp \
-  --container-workdir=/opt/CosyVoice \
-  python /opt/CosyVoice/tools/container_smoke_test.py
+srun --ntasks=1 -p REPLACE_PARTITION \
+  --container-image docker.io#REPLACE_DOCKERHUB_NAMESPACE/cosyvoice3_202607:TAG \
+  --container-save /mnt/home/REPLACE_USERNAME/cosyvoice3/images/cosyvoice3_TAG.sqsh \
+  true
+
+srun -N 1 -p REPLACE_PARTITION --mpi=pmix \
+  --gres=gpu:h100:1 --ntasks-per-node=1 \
+  --container-image /mnt/home/REPLACE_USERNAME/cosyvoice3/images/cosyvoice3_TAG.sqsh \
+  --container-mounts /mnt/home/REPLACE_USERNAME/cosyvoice3/taigi_v1:/workspace,/mnt/shared/REPLACE_ORG/drama_segments:/datasets,/mnt/home/REPLACE_USERNAME/cosyvoice3/qc:/qc,/mnt/home/REPLACE_USERNAME/cosyvoice3/taigi_v1/cache:/tmp/cosyvoice-cache \
+  bash -c 'cd /opt/CosyVoice && python tools/container_smoke_test.py --cpu-only'
 ```
 
-Pyxis 可接受 OCI image URI 或 squashfs 路徑，但 Taipei-1 是否啟用該功能尚需確認。[NVIDIA Pyxis](https://github.com/NVIDIA/pyxis)
+正式 PyTorch 8-GPU 作業用一個 Slurm task，再由 `torchrun --nproc_per_node=8` 管理八張 GPU。完整 `.sqsh`、互動 preflight、外部掛載與 `sbatch` 教學見 `docs/taigi-training-runbook.md`；LLM 與 HiFT 範本分別在 `examples/taigi/cosyvoice3/jobs/taipei1_train_llm.sbatch`、`examples/taigi/cosyvoice3/jobs/taipei1_train_hifigan.sbatch`。
 
-送件前向管理者確認：registry 與登入方式、compute node 能否 pull、接受 OCI／`.sqsh`／`.sif` 哪一種格式、Slurm partition/account/QoS、掛載語法、shared memory、NCCL/InfiniBand 與多節點啟動方式。
+仍需依核配資訊填入 partition/account/QoS，並確認 registry credential、資料使用政策、最長作業時間與多節點 NCCL 設定。Taipei-1 官方指南：<https://hackmd.io/@MasonWu/r1p9Hb88gg>。
