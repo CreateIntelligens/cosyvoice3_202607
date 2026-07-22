@@ -366,7 +366,7 @@ docker run --rm --gpus all REGISTRY/cosyvoice3-taigi:COMMIT \
 ```text
 /opt/CosyVoice           image 內固定程式
 /workspace               外部 experiment root，可寫
-/workspace/models        官方模型
+/models                  官方 base model，正式 job 唯讀
 /workspace/prepared      manifest、特徵與 Parquet
 /workspace/exp           checkpoint
 /workspace/tensorboard   log
@@ -374,14 +374,13 @@ docker run --rm --gpus all REGISTRY/cosyvoice3-taigi:COMMIT \
 /qc                      外部 QC JSON，唯讀
 ```
 
-Taipei-1 實際啟動命令可能是 Slurm + Pyxis/Enroot，也可能由平台 wrapper 提交。以下只是結構示意，不可在未知平台參數下原樣提交：
+Taipei-1 資料準備階段才掛載 `/datasets`、`/qc`；正式訓練只掛載 `/models`、`/workspace` 與 cache。以下是發布前環境驗證，不屬於正式訓練 job：
 
 ```bash
 srun <Taipei-1 allocation options> \
   --container-image=REGISTRY/cosyvoice3-taigi:COMMIT \
-  --container-mounts=HOST_WORKSPACE:/workspace,HOST_DATASETS:/datasets:ro,HOST_QC:/qc:ro \
-  --container-workdir=/opt/CosyVoice \
-  python /opt/CosyVoice/tools/container_smoke_test.py
+  --container-mounts=HOST_MODELS:/models:ro,HOST_WORKSPACE:/workspace \
+  bash -c 'python -c "import torch; assert torch.cuda.is_available(); print(torch.cuda.get_device_name(0))"'
 ```
 
 manifest 一律保存 `/workspace` 或 `/datasets` 的容器內路徑，不保存 host 實體路徑。單一 root、分離掛載、`MATERIALIZE` 與權限規則見完整 runbook 第 2 節。
@@ -392,30 +391,30 @@ manifest 一律保存 `/workspace` 或 `/datasets` 的容器內路徑，不保�
 
 ## 9. 模型與資料前處理
 
-下載官方 base model 到共享儲存：
+在可連網開發機下載官方 base model，再一次性同步到 Taipei-1 canonical 模型庫；不要從 smoke workspace 取正式模型：
 
 ```python
 from huggingface_hub import snapshot_download
 
 snapshot_download(
     "FunAudioLLM/Fun-CosyVoice3-0.5B-2512",
-    local_dir="/workspace/models/Fun-CosyVoice3-0.5B"
+    local_dir="/home/hank/Cosyvoice3/workspace/models/Fun-CosyVoice3-0.5B"
 )
 ```
 
-若 compute node 不可連網，在可連網節點先下載、檢查完整性，再傳入共享儲存。
+Taipei-1 host 存放於 `/mnt/home/<USERNAME>/cosyvoice3/models/Fun-CosyVoice3-0.5B`，正式容器掛成 `/models/Fun-CosyVoice3-0.5B`。
 
 對 train/dev/test 分別執行：
 
 ```bash
 python /opt/CosyVoice/tools/extract_embedding.py \
   --dir /workspace/prepared/data/train \
-  --onnx_path /workspace/models/Fun-CosyVoice3-0.5B/campplus.onnx \
+  --onnx_path /models/Fun-CosyVoice3-0.5B/campplus.onnx \
   --num_thread 16
 
 python /opt/CosyVoice/tools/extract_speech_token.py \
   --dir /workspace/prepared/data/train \
-  --onnx_path /workspace/models/Fun-CosyVoice3-0.5B/speech_tokenizer_v3.onnx \
+  --onnx_path /models/Fun-CosyVoice3-0.5B/speech_tokenizer_v3.onnx \
   --num_thread 16
 
 mkdir -p /workspace/prepared/data/train/parquet
@@ -475,10 +474,10 @@ torchrun --standalone --nnodes=1 --nproc_per_node="$NUM_GPUS" \
   --config /workspace/conf/taigi_cosyvoice3.yaml \
   --train_data /workspace/prepared/data/train/parquet/data.list \
   --cv_data /workspace/prepared/data/dev/parquet/data.list \
-  --qwen_pretrain_path /workspace/models/Fun-CosyVoice3-0.5B/CosyVoice-BlankEN \
-  --onnx_path /workspace/models/Fun-CosyVoice3-0.5B \
+  --qwen_pretrain_path /models/Fun-CosyVoice3-0.5B/CosyVoice-BlankEN \
+  --onnx_path /models/Fun-CosyVoice3-0.5B \
   --model llm \
-  --checkpoint /workspace/models/Fun-CosyVoice3-0.5B/llm.pt \
+  --checkpoint /models/Fun-CosyVoice3-0.5B/llm.pt \
   --model_dir /workspace/exp/taigi_zh2taigi/llm \
   --tensorboard_dir /workspace/exp/taigi_zh2taigi/tensorboard/llm \
   --ddp.dist_backend nccl \
@@ -499,10 +498,10 @@ torchrun --standalone --nnodes=1 --nproc_per_node="$NUM_GPUS" \
   --config /workspace/conf/taigi_cosyvoice3.yaml \
   --train_data /workspace/prepared/data/train/parquet/data.list \
   --cv_data /workspace/prepared/data/dev/parquet/data.list \
-  --qwen_pretrain_path /workspace/models/Fun-CosyVoice3-0.5B/CosyVoice-BlankEN \
-  --onnx_path /workspace/models/Fun-CosyVoice3-0.5B \
+  --qwen_pretrain_path /models/Fun-CosyVoice3-0.5B/CosyVoice-BlankEN \
+  --onnx_path /models/Fun-CosyVoice3-0.5B \
   --model flow \
-  --checkpoint /workspace/models/Fun-CosyVoice3-0.5B/flow.pt \
+  --checkpoint /models/Fun-CosyVoice3-0.5B/flow.pt \
   --model_dir /workspace/exp/taigi/flow \
   --tensorboard_dir /workspace/exp/taigi/tensorboard/flow \
   --ddp.dist_backend nccl \
@@ -572,7 +571,7 @@ discriminator.*
 
 ```bash
 python /opt/CosyVoice/tools/convert_hift_checkpoint.py wrap \
-  /workspace/models/Fun-CosyVoice3-0.5B/hift.pt \
+  /models/Fun-CosyVoice3-0.5B/hift.pt \
   /workspace/exp/taigi/hifigan_init.pt
 ```
 
@@ -611,8 +610,8 @@ torchrun --standalone --nnodes=1 --nproc_per_node="$NUM_GPUS" \
   --config /workspace/conf/taigi_cosyvoice3.yaml \
   --train_data /workspace/prepared/data/train/parquet/data.list \
   --cv_data /workspace/prepared/data/dev/parquet/data.list \
-  --qwen_pretrain_path /workspace/models/Fun-CosyVoice3-0.5B/CosyVoice-BlankEN \
-  --onnx_path /workspace/models/Fun-CosyVoice3-0.5B \
+  --qwen_pretrain_path /models/Fun-CosyVoice3-0.5B/CosyVoice-BlankEN \
+  --onnx_path /models/Fun-CosyVoice3-0.5B \
   --model hifigan \
   --checkpoint /workspace/exp/taigi/hifigan_init.pt \
   --model_dir /workspace/exp/taigi/hifigan \
@@ -673,7 +672,7 @@ Fun-CosyVoice3-Taigi/
 from cosyvoice.cli.cosyvoice import AutoModel
 import torchaudio
 
-model = AutoModel(model_dir="/workspace/models/Fun-CosyVoice3-Taigi")
+model = AutoModel(model_dir="/workspace/deploy/Fun-CosyVoice3-Taigi")
 instruction = "You are a helpful assistant. 請將輸入的華語翻譯成自然的臺灣台語並朗讀。<|endofprompt|>"
 
 for index, result in enumerate(model.inference_instruct2(

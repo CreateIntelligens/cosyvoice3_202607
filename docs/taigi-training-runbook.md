@@ -37,32 +37,34 @@ NAS 只作為原始資料的唯讀來源：
 /mnt/nas/dataset202607/segments/drama2
 ```
 
-所有可重建產物放在 repo 下，且已被 Git 與 Docker build context 忽略：
+開發測試產物與正式 base model 分開，兩者都在 Git／Docker build context 忽略的 `workspace/` 下：
 
 ```text
-/home/hank/Cosyvoice3/workspace/cosyvoice3_smoke_10spk/
-├── models/Fun-CosyVoice3-0.5B/
-├── prepared/
-├── conf/
-├── exp/
-├── tensorboard/
-└── torch_extensions/
+/home/hank/Cosyvoice3/workspace/
+├── models/Fun-CosyVoice3-0.5B/       # canonical base model，不屬於 smoke
+└── cosyvoice3_smoke_10spk/           # 只供開發流程測試
+    ├── prepared/
+    ├── conf/
+    ├── exp/
+    ├── tensorboard/
+    └── torch_extensions/
 ```
 
 不要在 NAS 下載模型、建立 cache、Parquet、checkpoint 或 TensorBoard log。
 
 ### 2.2 Taipei-1
 
-Taipei-1 的 `/workspace` 是「容器內掛載點」；host 端應使用官方提供的持久儲存，例如個人 `/mnt/home/<USERNAME>` 或團隊 `/mnt/shared/<ORG_NAME>`，不是目前這台機器的 NAS：
+Taipei-1 的 base model 與 experiment 是兩個獨立持久目錄；正式 job 不使用 smoke workspace：
 
 ```text
-/workspace/
-├── models/Fun-CosyVoice3-0.5B/
-├── prepared/data/{train,dev,test}/
-├── conf/
-├── exp/
-├── tensorboard/
-└── run-metadata/
+/mnt/home/<USERNAME>/cosyvoice3/
+├── models/Fun-CosyVoice3-0.5B/       # host canonical base model
+└── taigi_v1/                         # host experiment root
+    ├── prepared/data/{train,dev,test}/
+    ├── conf/
+    ├── exp/
+    ├── tensorboard/
+    └── run-metadata/
 ```
 
 image 內程式固定在 `/opt/CosyVoice`。正式作業不要用 host repo 覆蓋它，確保 image digest 能代表實際程式碼。
@@ -74,6 +76,7 @@ image 內程式固定在 `/opt/CosyVoice`。正式作業不要用 host repo 覆�
 | 內容 | 容器內固定路徑 | 權限 | 是否可能寫進 manifest/checkpoint |
 |---|---|---|---|
 | Image 內程式 | `/opt/CosyVoice` | image 內唯讀 | 會出現在 launch command |
+| 官方 base model | `/models/Fun-CosyVoice3-0.5B` | 唯讀 | 會出現在 launch command |
 | 實驗 workspace | `/workspace` | 可寫 | 會 |
 | 原始 drama1/drama2 | `/datasets` | 唯讀 | `MATERIALIZE=none` 時會 |
 | QC JSON | `/qc` | 唯讀 | 通常不會，但 summary 會記來源 |
@@ -87,9 +90,10 @@ Taipei-1 host: /mnt/home/<USERNAME>/cosyvoice3/taigi_v1
 其他 GPU host: /srv/training/cosyvoice3/taigi_v1
 ```
 
-只要都掛成容器內 `/workspace`，manifest 與命令就不需要改：
+固定容器路徑後，host 實體位置可變而命令不變：
 
 ```text
+HOST canonical model root → /models
 HOST 任意實體路徑 → /workspace
 HOST 原始資料路徑 → /datasets
 HOST QC 路徑       → /qc
@@ -114,48 +118,52 @@ HOST QC 路徑       → /qc
 
 `prepare_taigi_data.py` 的 `--container-source` 與 `--container-output-root` 就是用來區分「掃描時看見的 host/mount 路徑」和「寫進 manifest 的固定容器路徑」。既有 orchestration 已將它們設為 `/datasets` 與 `/workspace/prepared`。
 
-### 2.5 推薦：單一外部 experiment root
+### 2.5 推薦：base model 與 experiment 分離
 
-最穩定的做法是把模型、prepared data、設定、checkpoint 與 log 放在同一個容器外目錄：
+官方 base model 是固定輸入；prepared data、設定、checkpoint 與 log 是實驗產物。兩者不要混在 smoke 目錄或同一個可寫模型目錄：
 
 ```text
-/mnt/home/<USERNAME>/cosyvoice3/taigi_v1/
-├── models/
-├── prepared/
-├── conf/
-├── exp/
-├── tensorboard/
-├── run-metadata/
-└── cache/
+/mnt/home/<USERNAME>/cosyvoice3/
+├── models/Fun-CosyVoice3-0.5B/
+└── taigi_v1/
+    ├── prepared/
+    ├── conf/
+    ├── exp/
+    ├── tensorboard/
+    ├── run-metadata/
+    └── cache/
 ```
 
 Docker：
 
 ```bash
 task_workspace=/SHARED/PROJECT/cosyvoice3/taigi_v1
+task_models=/SHARED/PROJECT/cosyvoice3/models
 task_datasets=/SHARED/DATASETS/drama_segments
 task_qc=/SHARED/PROJECT/cosyvoice3/qc
 
 docker run --rm --gpus all --ipc=host --shm-size=32g \
   -v "${task_workspace}:/workspace" \
+  -v "${task_models}:/models:ro" \
   -v "${task_datasets}:/datasets:ro" \
   -v "${task_qc}:/qc:ro" \
   IMAGE \
-  bash /opt/CosyVoice/examples/taigi/cosyvoice3/prepare_data.sh
+  env MODEL_DIR=/models/Fun-CosyVoice3-0.5B bash /opt/CosyVoice/examples/taigi/cosyvoice3/prepare_data.sh
 ```
 
 Taipei-1 官方 Pyxis/Enroot 掛載結構：
 
 ```bash
 task_workspace=/mnt/home/REPLACE_USERNAME/cosyvoice3/taigi_v1
+task_models=/mnt/home/REPLACE_USERNAME/cosyvoice3/models
 task_datasets=/mnt/shared/REPLACE_ORG/drama_segments
 task_qc=/mnt/home/REPLACE_USERNAME/cosyvoice3/qc
 task_cache=/mnt/home/REPLACE_USERNAME/cosyvoice3/taigi_v1/cache
 
 srun -N 1 -p REPLACE_PARTITION --ntasks=1 \
   --container-image /mnt/home/REPLACE_USERNAME/cosyvoice3/images/cosyvoice3_TAG.sqsh \
-  --container-mounts "${task_workspace}:/workspace,${task_datasets}:/datasets,${task_qc}:/qc,${task_cache}:/tmp/cosyvoice-cache" \
-  bash -c 'cd /opt/CosyVoice && bash examples/taigi/cosyvoice3/prepare_data.sh'
+  --container-mounts "${task_workspace}:/workspace,${task_models}:/models:ro,${task_datasets}:/datasets:ro,${task_qc}:/qc:ro,${task_cache}:/tmp/cosyvoice-cache" \
+  bash -c 'cd /opt/CosyVoice && MODEL_DIR=/models/Fun-CosyVoice3-0.5B MODE=full bash examples/taigi/cosyvoice3/prepare_data.sh'
 ```
 
 官方文件確認 `--container-mounts HOST:CONTAINER` 與逗號分隔多掛載。文件沒有示範 `:ro` 第三欄，因此上面的正式相容指令只使用兩欄；原始資料仍應以 Taipei-1 ACL／權限設成不可寫，並由腳本遵守不寫回 `/datasets`、`/qc`。若管理者確認該版 Pyxis 支援 `:ro`，再加上唯讀旗標。
@@ -177,7 +185,7 @@ Taipei-1 login node 只建立小目錄與提交作業，不在 login node 下載
 ```bash
 module load slurm
 mkdir -p /mnt/home/REPLACE_USERNAME/cosyvoice3/images
-mkdir -p /mnt/home/REPLACE_USERNAME/cosyvoice3/taigi_v1/{models,prepared,conf,exp,tensorboard,run-metadata,cache}
+mkdir -p /mnt/home/REPLACE_USERNAME/cosyvoice3/models /mnt/home/REPLACE_USERNAME/cosyvoice3/taigi_v1/{prepared,conf,exp,tensorboard,run-metadata,cache}
 ```
 
 透過 compute node 將 registry image 固定成 `.sqsh`：
@@ -197,40 +205,26 @@ srun --ntasks=1 -p REPLACE_PARTITION \
 srun -N 1 -p REPLACE_PARTITION --mpi=pmix \
   --gres=gpu:h100:1 --ntasks-per-node=1 \
   --container-image /mnt/home/REPLACE_USERNAME/cosyvoice3/images/cosyvoice3_TAG.sqsh \
-  --container-mounts /mnt/home/REPLACE_USERNAME/cosyvoice3/taigi_v1:/workspace,/mnt/shared/REPLACE_ORG/drama_segments:/datasets,/mnt/home/REPLACE_USERNAME/cosyvoice3/qc:/qc,/mnt/home/REPLACE_USERNAME/cosyvoice3/taigi_v1/cache:/tmp/cosyvoice-cache \
+  --container-mounts /mnt/home/REPLACE_USERNAME/cosyvoice3/taigi_v1:/workspace,/mnt/home/REPLACE_USERNAME/cosyvoice3/models:/models:ro,/mnt/shared/REPLACE_ORG/drama_segments:/datasets:ro,/mnt/home/REPLACE_USERNAME/cosyvoice3/qc:/qc:ro,/mnt/home/REPLACE_USERNAME/cosyvoice3/taigi_v1/cache:/tmp/cosyvoice-cache \
   --pty /bin/bash
 
 cd /opt/CosyVoice
-python tools/container_smoke_test.py --cpu-only
-nvidia-smi
+python -c "import torch; assert torch.cuda.is_available(); print([torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())])"
 ```
 
 正式 immutable job 不需要 `--container-writable` 或 `--container-remap-root`；所有寫入都導向 `/workspace` 與 `/tmp/cosyvoice-cache`。只有為了暫時修改容器內容做診斷時才使用這兩個選項，修改後要用 `enroot export` 另存新 image，不要把互動修改當成正式可重現環境。`--container-mount-home` 也是選用，這套流程已顯式掛載所需路徑，不依賴容器內的 home。
 
 > Taipei-1 官方指南明確限制機敏、營業秘密或專有資訊，也禁止未授權／違法資料。三立與《鳥來伯與十三姨》的音影音源、字幕及衍生 Parquet 在上傳前，必須先取得資料授權並向 Taipei-1 管理單位書面確認符合使用政策；技術上可掛載不代表政策上允許處理。
 
-### 2.7 替代：多個外部目錄分開掛載
+### 2.7 正式訓練的最小掛載集合
 
-若模型、資料與輸出由不同儲存區管理，也可分開掛載：
-
-```bash
-docker run --rm --gpus all --ipc=host --shm-size=32g \
-  -v /HOST/base-model:/workspace/models/Fun-CosyVoice3-0.5B:ro \
-  -v /HOST/prepared:/workspace/prepared:ro \
-  -v /HOST/conf:/workspace/conf:ro \
-  -v /HOST/exp:/workspace/exp \
-  -v /HOST/tensorboard:/workspace/tensorboard \
-  -v /HOST/jobs:/workspace/jobs:ro \
-  IMAGE \
-  bash /workspace/jobs/train_llm_v1.sh
-```
+正式訓練維持 `/models` 唯讀與 `/workspace` 可寫，不要把 base model 掛進 experiment 子目錄。原始 `/datasets` 與 `/qc` 只在 Stage 0 資料準備時掛載；Parquet 完成後，LLM、flow 與 HiFi-GAN job 不再依賴它們。
 
 注意：
 
-- Docker 通常支援這種 nested mounts；Taipei-1 的 Pyxis/Enroot 是否允許及掛載順序要先做 tiny test。
-- 訓練時 `prepared`、base model、conf 可唯讀；`exp`、TensorBoard 與 run metadata 必須可寫。
+- 訓練時 base model 唯讀；`exp`、TensorBoard 與 run metadata 必須可寫。
 - 若 `data.list` 內容仍是 `/workspace/prepared/...`，掛載點就必須維持相同。
-- 多個掛載比單一 experiment root 更容易有權限與遺漏問題，第一版優先使用單一 root。
+- `/models` 與 `/workspace` 是固定介面；SBATCH 提交時必須同時提供 `TP1_MODELS` 與 `TP1_WORKSPACE`。
 
 ### 2.8 `MATERIALIZE=copy` 與 `none`
 
@@ -252,17 +246,17 @@ docker run --rm --gpus all --ipc=host --shm-size=32g \
 
 ### 2.9 Model 放在容器外
 
-模型不應烘進 image。可以放在 experiment root：
+模型不烘進 image，也不放在 smoke 或 experiment root。canonical 位置是：
 
 ```text
-HOST: /SHARED/PROJECT/cosyvoice3/taigi_v1/models/Fun-CosyVoice3-0.5B
-CONTAINER: /workspace/models/Fun-CosyVoice3-0.5B
+HOST: /mnt/home/<USERNAME>/cosyvoice3/models/Fun-CosyVoice3-0.5B
+CONTAINER: /models/Fun-CosyVoice3-0.5B
 ```
 
-也可用獨立唯讀模型庫：
+Docker 等價掛載：
 
 ```bash
--v /SHARED/MODELS/Fun-CosyVoice3-0.5B:/workspace/models/Fun-CosyVoice3-0.5B:ro
+-v /HOST/cosyvoice3/models:/models:ro
 ```
 
 checkpoint 必須寫到另一個可寫路徑，例如 `/workspace/exp`；不要將訓練輸出寫回 base model mount。
@@ -285,7 +279,7 @@ checkpoint 必須寫到另一個可寫路徑，例如 `/workspace/exp`；不要�
 set -euo pipefail
 mkdir -p /workspace/exp /workspace/tensorboard /workspace/run-metadata
 test -r /opt/CosyVoice/cosyvoice/bin/train.py
-test -r /workspace/models/Fun-CosyVoice3-0.5B/llm.pt
+test -s /models/Fun-CosyVoice3-0.5B/llm.pt
 test -r /workspace/prepared/data/train/parquet/data.list
 test -r /workspace/prepared/data/dev/parquet/data.list
 test -w /workspace/exp
@@ -344,25 +338,22 @@ docker run --rm --gpus all --ipc=host IMAGE \
 
 成功條件：PyTorch、torchaudio、DeepSpeed、CosyVoice、Matcha-TTS 可 import；`torch.cuda.is_available()` 為 true；ONNX Runtime providers 包含 `CUDAExecutionProvider`。
 
-目前 image 尚未重建時，可將 repo 唯讀掛到 `/project` 測試，但必須同時設定：
-
-```bash
--e COSYVOICE_ROOT=/project \
--e PYTHONPATH=/project:/project/third_party/Matcha-TTS \
--v /home/hank/Cosyvoice3:/project:ro
-```
-
-這只適合本機開發，不是正式 Taipei-1 作業方式。
-
 ## 5. 準備官方模型
 
-在可連網的開發或 login 節點下載，不假設 compute node 能連網：
+模型不是 smoke 產物。先在可連網開發機下載到 canonical cache，不在 Taipei-1 login node 做大型下載：
 
 ```bash
 docker run --rm \
-  -v /HOST/WORKSPACE:/workspace \
+  -v /home/hank/Cosyvoice3/workspace/models:/models \
   IMAGE \
-  python -c "from huggingface_hub import snapshot_download; snapshot_download('FunAudioLLM/Fun-CosyVoice3-0.5B-2512', local_dir='/workspace/models/Fun-CosyVoice3-0.5B', ignore_patterns=['flow.decoder.estimator.fp32.onnx'])"
+  python -c "from huggingface_hub import snapshot_download; snapshot_download('FunAudioLLM/Fun-CosyVoice3-0.5B-2512', local_dir='/models/Fun-CosyVoice3-0.5B', ignore_patterns=['flow.decoder.estimator.fp32.onnx'])"
+```
+
+再一次性上傳到 Taipei-1 持久模型庫：
+
+```bash
+rsync -avP /home/hank/Cosyvoice3/workspace/models/Fun-CosyVoice3-0.5B/ \
+  taipei1-login:/mnt/home/REPLACE_USERNAME/cosyvoice3/models/Fun-CosyVoice3-0.5B/
 ```
 
 訓練必要檔：
@@ -408,10 +399,10 @@ docker run --rm \
 MODE=full STAGE=0 STOP_STAGE=0 MATERIALIZE=copy \
   bash /opt/CosyVoice/examples/taigi/cosyvoice3/prepare_data.sh
 
-MODE=full STAGE=1 STOP_STAGE=1 NUM_THREADS=16 \
+MODEL_DIR=/models/Fun-CosyVoice3-0.5B MODE=full STAGE=1 STOP_STAGE=1 NUM_THREADS=16 \
   bash /opt/CosyVoice/examples/taigi/cosyvoice3/prepare_data.sh
 
-MODE=full STAGE=2 STOP_STAGE=2 NUM_THREADS=16 \
+MODEL_DIR=/models/Fun-CosyVoice3-0.5B MODE=full STAGE=2 STOP_STAGE=2 NUM_THREADS=16 \
   bash /opt/CosyVoice/examples/taigi/cosyvoice3/prepare_data.sh
 
 MODE=full STAGE=3 STOP_STAGE=3 \
@@ -512,9 +503,9 @@ torchrun --standalone --nnodes=1 --nproc_per_node=8 \
   --config /workspace/conf/taigi_cosyvoice3_v1.yaml \
   --train_data /workspace/prepared/data/train/parquet/data.list \
   --cv_data /workspace/prepared/data/dev/parquet/data.list \
-  --qwen_pretrain_path /workspace/models/Fun-CosyVoice3-0.5B/CosyVoice-BlankEN \
-  --onnx_path /workspace/models/Fun-CosyVoice3-0.5B \
-  --checkpoint /workspace/models/Fun-CosyVoice3-0.5B/llm.pt \
+  --qwen_pretrain_path /models/Fun-CosyVoice3-0.5B/CosyVoice-BlankEN \
+  --onnx_path /models/Fun-CosyVoice3-0.5B \
+  --checkpoint /models/Fun-CosyVoice3-0.5B/llm.pt \
   --model_dir /workspace/exp/taigi_v1/llm_ddp \
   --tensorboard_dir /workspace/tensorboard/taigi_v1/llm_ddp \
   --ddp.dist_backend nccl \
@@ -527,7 +518,7 @@ Slurm/Pyxis 正式單節點範本已放在 `examples/taigi/cosyvoice3/jobs/taipe
 module load slurm
 
 sbatch -p REPLACE_PARTITION -A REPLACE_ACCOUNT \
-  --export=ALL,TP1_IMAGE=/mnt/home/REPLACE_USERNAME/cosyvoice3/images/cosyvoice3_TAG.sqsh,TP1_WORKSPACE=/mnt/home/REPLACE_USERNAME/cosyvoice3/taigi_v1,TP1_DATASETS=/mnt/shared/REPLACE_ORG/drama_segments,TP1_QC=/mnt/home/REPLACE_USERNAME/cosyvoice3/qc \
+  --export=ALL,TP1_IMAGE=/mnt/home/REPLACE_USERNAME/cosyvoice3/images/cosyvoice3_TAG.sqsh,TP1_WORKSPACE=/mnt/home/REPLACE_USERNAME/cosyvoice3/taigi_v1,TP1_MODELS=/mnt/home/REPLACE_USERNAME/cosyvoice3/models \
   examples/taigi/cosyvoice3/jobs/taipei1_train_llm.sbatch
 ```
 
@@ -603,9 +594,9 @@ torchrun --standalone --nnodes=1 --nproc_per_node=8 \
   --config /workspace/conf/taigi_cosyvoice3_v1.yaml \
   --train_data /workspace/prepared/data/train/parquet/data.list \
   --cv_data /workspace/prepared/data/dev/parquet/data.list \
-  --qwen_pretrain_path /workspace/models/Fun-CosyVoice3-0.5B/CosyVoice-BlankEN \
-  --onnx_path /workspace/models/Fun-CosyVoice3-0.5B \
-  --checkpoint /workspace/models/Fun-CosyVoice3-0.5B/flow.pt \
+  --qwen_pretrain_path /models/Fun-CosyVoice3-0.5B/CosyVoice-BlankEN \
+  --onnx_path /models/Fun-CosyVoice3-0.5B \
+  --checkpoint /models/Fun-CosyVoice3-0.5B/flow.pt \
   --model_dir /workspace/exp/taigi_v1/flow_ddp \
   --tensorboard_dir /workspace/tensorboard/taigi_v1/flow_ddp \
   --ddp.dist_backend nccl \
@@ -638,29 +629,30 @@ examples/taigi/cosyvoice3/jobs/taipei1_train_hifigan.sbatch
 
 ## 14. 組裝可推論模型
 
-不要覆蓋官方 base：
+不要覆蓋 `/models` 的官方 base；部署候選模型寫入 experiment 的 `/workspace/deploy`：
 
 ```bash
-cp -a /workspace/models/Fun-CosyVoice3-0.5B \
-  /workspace/models/Fun-CosyVoice3-Taigi-v1
+mkdir -p /workspace/deploy
+cp -a /models/Fun-CosyVoice3-0.5B \
+  /workspace/deploy/Fun-CosyVoice3-Taigi-v1
 
 cp /workspace/exp/taigi_v1/llm_avg5.pt \
-  /workspace/models/Fun-CosyVoice3-Taigi-v1/llm.pt
+  /workspace/deploy/Fun-CosyVoice3-Taigi-v1/llm.pt
 
 # 只有 flow 通過評估時才替換。
 cp /workspace/exp/taigi_v1/flow_ddp/FLOW_CHECKPOINT.pt \
-  /workspace/models/Fun-CosyVoice3-Taigi-v1/flow.pt
+  /workspace/deploy/Fun-CosyVoice3-Taigi-v1/flow.pt
 ```
 
 預設保留 base 目錄中的官方 `hift.pt`；只有候選模型通過第 13 節全部 gate 才替換，而且另建模型目錄，不覆蓋官方 base。
 
-推論 smoke：
+候選模型驗收推論：
 
 ```python
 from cosyvoice.cli.cosyvoice import AutoModel
 import torchaudio
 
-model = AutoModel(model_dir="/workspace/models/Fun-CosyVoice3-Taigi-v1")
+model = AutoModel(model_dir="/workspace/deploy/Fun-CosyVoice3-Taigi-v1")
 instruction = "You are a helpful assistant. 請將輸入的華語翻譯成自然的臺灣台語並朗讀。<|endofprompt|>"
 
 for i, result in enumerate(model.inference_instruct2(
@@ -737,7 +729,7 @@ list 的子欄位可名為 `element`；頂層必須仍是 `utt_embedding`、`spk
 
 ## 18. 正式開跑前最終清單
 
-- [ ] image 已包含目前 repo 修改且通過 CPU/GPU smoke。
+- [ ] image 已包含目前 repo 修改且在發布前通過 CPU/GPU 環境驗證；正式訓練 job 不呼叫 smoke script。
 - [ ] 模型與所有 workspace 產物不在 NAS、不進 Git、不烘進 image。
 - [ ] 全量 manifest/Parquet validator 通過。
 - [ ] train/dev/test 以 group/episode 隔離，speaker 分布已保存。

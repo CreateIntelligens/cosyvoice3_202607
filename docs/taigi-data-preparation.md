@@ -105,10 +105,10 @@ drama2: 001,002,003,004,005
 
 ## 4. Stage 1–3：特徵與 Parquet
 
-先將官方 `FunAudioLLM/Fun-CosyVoice3-0.5B-2512` 下載到：
+官方 base model 不屬於 smoke dataset，下載到 canonical cache：
 
 ```text
-/home/hank/Cosyvoice3/workspace/cosyvoice3_smoke_10spk/models/Fun-CosyVoice3-0.5B
+/home/hank/Cosyvoice3/workspace/models/Fun-CosyVoice3-0.5B
 ```
 
 可直接使用目前 image 下載；此命令完全不掛載 NAS，並排除 smoke 訓練不需要的 1.24 GB FP32 flow 匯出檔：
@@ -116,9 +116,9 @@ drama2: 001,002,003,004,005
 ```bash
 docker run --rm \
   -e HF_HUB_ENABLE_HF_TRANSFER=0 \
-  -v /home/hank/Cosyvoice3/workspace/cosyvoice3_smoke_10spk:/workspace \
+  -v /home/hank/Cosyvoice3/workspace/models:/models \
   IMAGE \
-  python -c "from huggingface_hub import snapshot_download; snapshot_download('FunAudioLLM/Fun-CosyVoice3-0.5B-2512', local_dir='/workspace/models/Fun-CosyVoice3-0.5B', ignore_patterns=['flow.decoder.estimator.fp32.onnx'])"
+  python -c "from huggingface_hub import snapshot_download; snapshot_download('FunAudioLLM/Fun-CosyVoice3-0.5B-2512', local_dir='/models/Fun-CosyVoice3-0.5B', ignore_patterns=['flow.decoder.estimator.fp32.onnx'])"
 ```
 
 本次實測下載後約 7.9 GB，並已確認 `llm.pt`、`flow.pt`、`hift.pt`、`campplus.onnx`、`speech_tokenizer_v3.onnx` 存在。若需要完整 FP32 ONNX 推論匯出，再另外下載該檔即可；PyTorch 訓練不依賴它。
@@ -128,6 +128,8 @@ embedding：
 ```bash
 docker run --rm \
   -v /home/hank/Cosyvoice3/workspace/cosyvoice3_smoke_10spk:/workspace \
+  -v /home/hank/Cosyvoice3/workspace/models:/models:ro \
+  -e MODEL_DIR=/models/Fun-CosyVoice3-0.5B \
   -e MODE=smoke -e STAGE=1 -e STOP_STAGE=1 \
   IMAGE \
   bash /opt/CosyVoice/examples/taigi/cosyvoice3/prepare_data.sh
@@ -138,6 +140,8 @@ speech token 需要 GPU：
 ```bash
 docker run --rm --gpus all --ipc=host \
   -v /home/hank/Cosyvoice3/workspace/cosyvoice3_smoke_10spk:/workspace \
+  -v /home/hank/Cosyvoice3/workspace/models:/models:ro \
+  -e MODEL_DIR=/models/Fun-CosyVoice3-0.5B \
   -e MODE=smoke -e STAGE=2 -e STOP_STAGE=2 \
   IMAGE \
   bash /opt/CosyVoice/examples/taigi/cosyvoice3/prepare_data.sh
@@ -163,20 +167,10 @@ stage 3 必須確認每個 `data.list` 指向存在的 shard，Parquet 含 `utt`
 docker run --rm --gpus all --ipc=host --shm-size=16g \
   -v /home/hank/Cosyvoice3/workspace/cosyvoice3_smoke_10spk/torch_extensions:/tmp/cosyvoice-cache \
   -v /home/hank/Cosyvoice3/workspace/cosyvoice3_smoke_10spk:/workspace \
+  -v /home/hank/Cosyvoice3/workspace/models:/models:ro \
+  -e MODEL_DIR=/models/Fun-CosyVoice3-0.5B \
   IMAGE \
   bash /opt/CosyVoice/examples/taigi/cosyvoice3/train_smoke.sh
-```
-
-目前 image 尚未重建時，要把 repo 最新程式碼掛進容器並讓 `/project` 優先於 image 內舊版：
-
-```bash
-docker run --rm --gpus all --ipc=host --shm-size=16g \
-  -e COSYVOICE_ROOT=/project -e PYTHONPATH=/project:/project/third_party/Matcha-TTS \
-  -v /home/hank/Cosyvoice3:/project:ro \
-  -v /home/hank/Cosyvoice3/workspace/cosyvoice3_smoke_10spk/torch_extensions:/tmp/cosyvoice-cache \
-  -v /home/hank/Cosyvoice3/workspace/cosyvoice3_smoke_10spk:/workspace \
-  cosyvoice3-taipei1:074ca6dc9e80-dirty \
-  bash /project/examples/taigi/cosyvoice3/train_smoke.sh
 ```
 
 若 H100 顯存充足而要改回一般 DDP：
