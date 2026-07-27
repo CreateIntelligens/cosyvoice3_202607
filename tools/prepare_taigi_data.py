@@ -23,7 +23,8 @@ import tempfile
 import soundfile as sf
 
 
-INSTRUCT = "You are a helpful assistant.<|endofprompt|>"
+INSTRUCT = "You are a helpful assistant. 請將輸入的華語翻譯成自然的臺灣台語並朗讀。<|endofprompt|>"
+HOLDOUT_SPLIT = "test_unseen_speaker"
 
 
 @dataclass(frozen=True)
@@ -209,6 +210,23 @@ def group_split(
     return result
 
 
+def partition_holdout(
+    candidates: list[Candidate],
+    holdout: dict[str, list[str]],
+) -> tuple[list[Candidate], list[Candidate]]:
+    """Split candidates into (trainable, held-out) by raw speaker directory.
+
+    Held-out speakers never reach train/dev/test so zero-shot evaluation sees
+    voices the model has not been conditioned on.
+    """
+    holdout_ids = {f"{source}-{raw}" for source, raws in holdout.items() for raw in raws}
+    if not holdout_ids:
+        return candidates, []
+    trainable = [item for item in candidates if item.speaker_id not in holdout_ids]
+    held = [item for item in candidates if item.speaker_id in holdout_ids]
+    return trainable, held
+
+
 def container_wav_path(
     candidate: Candidate,
     materialize: str,
@@ -271,6 +289,7 @@ def main() -> None:
     parser.add_argument("--source", action="append", required=True, metavar="NAME=PATH")
     parser.add_argument("--container-source", action="append", default=[], metavar="NAME=PATH")
     parser.add_argument("--speaker-list", action="append", default=[], metavar="NAME=ID,ID")
+    parser.add_argument("--holdout-speakers", action="append", default=[], metavar="NAME=ID,ID")
     parser.add_argument("--speakers-per-source", type=int, default=0)
     parser.add_argument("--qc-report", action="append", default=[], metavar="NAME=PATH")
     parser.add_argument("--output-dir", required=True)
@@ -290,6 +309,7 @@ def main() -> None:
     sources = {name: Path(path).resolve() for name, path in parse_mapping(args.source, "--source").items()}
     container_sources = parse_mapping(args.container_source, "--container-source")
     explicit_speakers = parse_speaker_lists(args.speaker_list)
+    holdout_speakers = parse_speaker_lists(args.holdout_speakers)
     exclusions = load_qc_exclusions(args.qc_report)
     ratios = (args.train_ratio, args.dev_ratio, args.test_ratio)
     if any(ratio < 0 for ratio in ratios) or abs(sum(ratios) - 1.0) > 1e-8:
@@ -300,6 +320,9 @@ def main() -> None:
         raise ValueError("group split is intended for full data; do not combine it with --max-per-speaker")
     if args.copy_workers < 1:
         raise ValueError("--copy-workers must be at least 1")
+    unknown_holdout = sorted(set(holdout_speakers) - set(sources))
+    if unknown_holdout:
+        raise ValueError(f"--holdout-speakers names unknown sources: {unknown_holdout}")
 
     all_candidates: list[Candidate] = []
     scan_summary: dict[str, object] = {}
@@ -309,6 +332,9 @@ def main() -> None:
             raise FileNotFoundError(f"source root not found: {root}")
         speakers = choose_speakers(source, root, explicit_speakers, args.speakers_per_source)
         selected_speakers[source] = speakers
+        missing_holdout = sorted(set(holdout_speakers.get(source, [])) - set(speakers), key=natural_key)
+        if missing_holdout:
+            raise ValueError(f"{source} holdout speakers are not in the selected set: {missing_holdout}")
         candidates, counters = scan_candidates(
             source,
             root,
@@ -320,12 +346,18 @@ def main() -> None:
         all_candidates.extend(candidates)
         scan_summary[source] = counters
 
+    trainable_candidates, holdout_candidates = partition_holdout(all_candidates, holdout_speakers)
+    if holdout_speakers and not holdout_candidates:
+        raise ValueError("--holdout-speakers matched no utterances after QC and duration filtering")
+
     if args.split_unit == "utterance":
-        split_data = utterance_split(all_candidates, ratios, args.max_per_speaker, args.seed)
+        split_data = utterance_split(trainable_candidates, ratios, args.max_per_speaker, args.seed)
     else:
-        split_data = group_split(all_candidates, ratios, args.seed)
+        split_data = group_split(trainable_candidates, ratios, args.seed)
     if any(not split_data[name] for name in ("train", "dev", "test")):
         raise ValueError("one or more splits are empty; adjust ratios, selected speakers, or split unit")
+    if holdout_candidates:
+        split_data[HOLDOUT_SPLIT] = holdout_candidates
 
     output_dir = Path(args.output_dir).resolve()
     if output_dir.exists():
@@ -366,6 +398,7 @@ def main() -> None:
             "split_unit": args.split_unit,
             "ratios": {"train": ratios[0], "dev": ratios[1], "test": ratios[2]},
             "selected_speakers": selected_speakers,
+            "holdout_speakers": holdout_speakers,
             "scan": scan_summary,
             "splits": {
                 name: {

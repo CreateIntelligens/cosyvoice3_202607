@@ -19,6 +19,12 @@ if [[ "${mode}" != "smoke" && "${mode}" != "full" ]]; then
   exit 2
 fi
 
+# Stage 1-3 需要處理 Stage 0 實際產生的每個 split，含選配的 test_unseen_speaker。
+list_splits() {
+  find "${prepared_dir}/data" -mindepth 1 -maxdepth 1 -type d -exec test -f '{}/wav.scp' \; -print \
+    | sed 's|.*/||' | sort
+}
+
 if (( stage <= 0 && stop_stage >= 0 )); then
   common_args=(
     --source "drama1=${dataset_root}/drama1"
@@ -52,8 +58,15 @@ if (( stage <= 0 && stop_stage >= 0 )); then
       --max-per-speaker 40
   else
     full_materialize="${MATERIALIZE:-copy}"
+    # HOLDOUT_SPEAKERS="drama1=101,102 drama2=055" 會把這些說話者整批排除在
+    # train/dev/test 之外，另存成 test_unseen_speaker 供 zero-shot 評估。
+    holdout_args=()
+    for entry in ${HOLDOUT_SPEAKERS:-}; do
+      holdout_args+=(--holdout-speakers "${entry}")
+    done
     python "${cosyvoice_root}/tools/prepare_taigi_data.py" \
       "${common_args[@]}" \
+      "${holdout_args[@]+"${holdout_args[@]}"}" \
       --materialize "${full_materialize}" \
       --copy-workers "${COPY_WORKERS:-16}" \
       --split-unit group \
@@ -66,7 +79,7 @@ fi
 
 if (( stage <= 1 && stop_stage >= 1 )); then
   test -f "${model_dir}/campplus.onnx"
-  for split in train dev test; do
+  for split in $(list_splits); do
     python "${cosyvoice_root}/tools/extract_embedding.py" \
       --dir "${prepared_dir}/data/${split}" \
       --onnx_path "${model_dir}/campplus.onnx" \
@@ -76,7 +89,7 @@ fi
 
 if (( stage <= 2 && stop_stage >= 2 )); then
   test -f "${model_dir}/speech_tokenizer_v3.onnx"
-  for split in train dev test; do
+  for split in $(list_splits); do
     python "${cosyvoice_root}/tools/extract_speech_token.py" \
       --dir "${prepared_dir}/data/${split}" \
       --onnx_path "${model_dir}/speech_tokenizer_v3.onnx" \
@@ -92,7 +105,7 @@ if (( stage <= 3 && stop_stage >= 3 )); then
     utts_per_parquet="${UTTS_PER_PARQUET:-1000}"
     parquet_processes="${PARQUET_PROCESSES:-16}"
   fi
-  for split in train dev test; do
+  for split in $(list_splits); do
     python "${cosyvoice_root}/tools/make_parquet_list.py" \
       --num_utts_per_parquet "${utts_per_parquet}" \
       --num_processes "${parquet_processes}" \

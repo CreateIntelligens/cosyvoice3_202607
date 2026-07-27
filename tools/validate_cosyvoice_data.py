@@ -105,17 +105,34 @@ def main() -> None:
     args = parser.parse_args()
 
     prepared_dir = Path(args.prepared_dir)
+    # train/dev/test are mandatory; optional extras such as test_unseen_speaker are
+    # validated too so a held-out split cannot silently overlap the training data.
+    extra_splits = sorted(
+        path.name
+        for path in (prepared_dir / "data").iterdir()
+        if path.is_dir() and path.name not in SPLITS and (path / "wav.scp").is_file()
+    )
+    splits = (*SPLITS, *extra_splits)
     summaries: dict[str, object] = {}
     split_keys: dict[str, set[str]] = {}
-    for split in SPLITS:
+    for split in splits:
         split_dir = prepared_dir / "data" / split
         summaries[split] = validate_split(split_dir, args.check_audio, args.require_parquet)
         split_keys[split] = set(read_keyed_file(split_dir / "wav.scp"))
-    for index, left in enumerate(SPLITS):
-        for right in SPLITS[index + 1:]:
+    for index, left in enumerate(splits):
+        for right in splits[index + 1:]:
             overlap = split_keys[left] & split_keys[right]
             if overlap:
                 raise ValueError(f"{left}/{right} overlap: {sorted(overlap)[:10]}")
+    # A held-out split is only meaningful when none of its speakers were trained on.
+    for split in extra_splits:
+        if not split.startswith("test_unseen_speaker"):
+            continue
+        held = set(read_keyed_file(prepared_dir / "data" / split / "spk2utt"))
+        for trained in ("train", "dev"):
+            leaked = held & set(read_keyed_file(prepared_dir / "data" / trained / "spk2utt"))
+            if leaked:
+                raise ValueError(f"{split} speakers also appear in {trained}: {sorted(leaked)[:10]}")
     print(json.dumps(summaries, ensure_ascii=False, indent=2))
 
 
