@@ -7,7 +7,7 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:h100:8
-#SBATCH --cpus-per-task=32
+#SBATCH --cpus-per-task=128
 #SBATCH --time=24:00:00
 #SBATCH --job-name=cosyvoice3-taigi-llm
 #SBATCH --output=slurm-%x-%j.out
@@ -53,5 +53,5 @@ srun --mpi=pmix \
       --model_dir /workspace/exp/taigi_v1/llm_ddp \
       --tensorboard_dir /workspace/tensorboard/taigi_v1/llm_ddp \
       --ddp.dist_backend nccl \
-      --num_workers 4 --prefetch 20 --pin_memory --use_amp
+      --num_workers 8 --prefetch 20 --pin_memory --use_amp
   '
