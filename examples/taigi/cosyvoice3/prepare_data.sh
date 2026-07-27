@@ -71,7 +71,9 @@ if (( stage <= 0 && stop_stage >= 0 )); then
       --copy-workers "${COPY_WORKERS:-16}" \
       --split-unit group \
       --min-duration "${MIN_DURATION:-1.0}" --max-duration "${MAX_DURATION:-30.0}" \
-      --train-ratio 0.98 --dev-ratio 0.01 --test-ratio 0.01
+      --train-ratio "${TRAIN_RATIO:-0.98}" \
+      --dev-ratio "${DEV_RATIO:-0.01}" \
+      --test-ratio "${TEST_RATIO:-0.01}"
   fi
   python "${cosyvoice_root}/tools/validate_cosyvoice_data.py" \
     --prepared-dir "${prepared_dir}" --check-audio
