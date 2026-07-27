@@ -30,6 +30,13 @@ srun --mpi=pmix \
     test -s /workspace/conf/taigi_cosyvoice3_v1.yaml
     test -s /workspace/prepared/data/train/parquet/data.list
     test -s /workspace/prepared/data/dev/parquet/data.list
+    # The official hift.pt is a bare generator state dict; GAN training expects a
+    # generator.*/discriminator.* wrapper. Build it once, never in place.
+    if [[ ! -s /workspace/exp/taigi_v1/hifigan_init.pt ]]; then
+      python tools/convert_hift_checkpoint.py wrap \
+        /models/Fun-CosyVoice3-0.5B/hift.pt \
+        /workspace/exp/taigi_v1/hifigan_init.pt
+    fi
     test -s /workspace/exp/taigi_v1/hifigan_init.pt
     test -w /workspace/exp
     python -c "import torch; assert torch.cuda.is_available(); assert torch.cuda.device_count() == 1, torch.cuda.device_count(); print(torch.cuda.get_device_name(0))"
