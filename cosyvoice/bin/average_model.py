@@ -63,10 +63,16 @@ def main():
                                    reverse=False)
         print("best val (epoch, step, loss, tag) = " +
               str(sorted_val_scores[:args.num]))
-        path_list = [
-            args.src_path + '/epoch_{}_whole.pt'.format(score[0])
-            for score in sorted_val_scores[:args.num]
-        ]
+        # Several yaml files can point at the same epoch: save_per_step writes an
+        # epoch_N_step_M.yaml next to epoch_N_whole.yaml, and both resolve to
+        # epoch_N_whole.pt. Deduplicate so one epoch cannot be averaged twice.
+        path_list = []
+        for score in sorted_val_scores:
+            path = args.src_path + '/epoch_{}_whole.pt'.format(score[0])
+            if path not in path_list:
+                path_list.append(path)
+            if len(path_list) == args.num:
+                break
     print(path_list)
     avg = {}
     num = args.num
