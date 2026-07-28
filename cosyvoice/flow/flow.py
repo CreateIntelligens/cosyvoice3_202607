@@ -345,7 +345,15 @@ class CausalMaskedDiffWithDiT(torch.nn.Module):
         # text encode
         h = self.pre_lookahead_layer(token)
         h = h.repeat_interleave(self.token_mel_ratio, dim=1)
-        mask = mask.repeat_interleave(self.token_mel_ratio, dim=1).squeeze(dim=-1)
+
+        # The 25 Hz speech tokenizer and the 50 Hz mel front-end round independently,
+        # so a clip usually carries one or two token frames more than its mel. Keep
+        # only the frames both sides describe: the DiT below concatenates h with the
+        # mel, and the loss mask must not mark mel padding as real audio.
+        feat_len = torch.minimum(feat_len, token_len * self.token_mel_ratio)
+        length = min(h.size(1), feat.size(1))
+        h, feat = h[:, :length], feat[:, :length]
+        mask = (~make_pad_mask(feat_len, max_len=length)).to(h)
 
         # get conditions
         conds = torch.zeros(feat.shape, device=token.device)
