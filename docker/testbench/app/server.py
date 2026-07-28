@@ -14,7 +14,7 @@ from __future__ import annotations
 import io
 import logging
 import os
-import random
+import secrets
 import shutil
 import sys
 import threading
@@ -69,9 +69,14 @@ def apply_seed(seed: int) -> int:
     LLM samples speech tokens with multinomial, and flow matching starts from
     torch.randn_like. Seeding both the CPU and CUDA generators is therefore
     enough to make a given (checkpoints, text, prompt, seed) reproduce exactly.
+
+    The automatic seed comes from secrets rather than the random module, whose
+    global state CausalConditionalCFM.__init__ resets with set_all_random_seed(0)
+    on every model load. Drawing from it returned the same number each time a
+    variant was swapped.
     """
     if seed < 0:
-        seed = random.randrange(MAX_SEED)
+        seed = secrets.randbelow(MAX_SEED)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
