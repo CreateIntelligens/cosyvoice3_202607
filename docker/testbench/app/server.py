@@ -14,6 +14,7 @@ from __future__ import annotations
 import io
 import logging
 import os
+import random
 import shutil
 import sys
 import threading
@@ -51,6 +52,22 @@ app = FastAPI(title="CosyVoice3 checkpoint testbench")
 _lock = threading.Lock()
 _loaded: tuple[str, str, str] | None = None
 _model = None
+
+
+def apply_seed(seed: int) -> int:
+    """Pin the RNG so a run can be repeated.
+
+    Both stochastic steps in inference draw from torch's global generator: the
+    LLM samples speech tokens with multinomial, and flow matching starts from
+    torch.randn_like. Seeding both the CPU and CUDA generators is therefore
+    enough to make a given (checkpoints, text, prompt, seed) reproduce exactly.
+    """
+    if seed < 0:
+        seed = random.randrange(2 ** 31 - 1)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    return seed
 
 
 def list_parts(part: str) -> list[str]:
@@ -137,6 +154,7 @@ def tts(
     prompt_name: str = Form(""),
     speed: float = Form(1.0),
     text_frontend: bool = Form(False),
+    seed: int = Form(-1),
     prompt_wav: UploadFile | None = File(None),
 ):
     if not BASE_DIR.is_dir():
@@ -159,6 +177,7 @@ def tts(
     try:
         with _lock:
             model = get_model(llm, flow, hift)
+            used_seed = apply_seed(seed)
             chunks = [
                 out["tts_speech"]
                 for out in model.inference_instruct2(
@@ -182,6 +201,8 @@ def tts(
         headers={
             "X-Variant": f"llm={llm};flow={flow};hift={hift}",
             "X-Duration-Sec": f"{audio.shape[1] / sample_rate:.2f}",
+            "X-Seed": str(used_seed),
+            "Access-Control-Expose-Headers": "X-Variant, X-Duration-Sec, X-Seed",
         },
     )
 

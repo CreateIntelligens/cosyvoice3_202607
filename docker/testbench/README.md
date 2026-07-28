@@ -74,6 +74,15 @@ curl -X POST http://localhost:50010/api/tts \
 | `GET /api/health` | CUDA 是否可用、目前載入的組合 |
 | `POST /api/tts` | 合成；`prompt_wav` 上傳檔或 `prompt_name` 選預設 |
 
+`POST /api/tts` 的 `seed` 預設 `-1`（每次隨機）。給定同一組 checkpoint、文字、音色與
+seed，輸出可完全重現（實測兩次 md5 相同）。推論的隨機只有 LLM 取樣的 `multinomial`
+與 flow matching 的 `torch.randn_like`，兩者都走 torch 全域 RNG。回應的 `X-Seed`
+header 會回報實際用到的值，即使沒指定。
+
+比較 checkpoint 時**務必固定 seed**，否則聽到的差異裡混雜了隨機取樣，分不出是模型
+造成的。文件 §14.2 也要求固定 prompt、文字與 seed。注意 seed 只保證同一組 checkpoint
+可重現；換 checkpoint 後機率分布不同，取樣路徑本來就會分岔。
+
 ## 注意事項
 
 - **一次只常駐一個組合。** 三個模組加起來要好幾 GB VRAM，而這台的 GPU 還跑著
