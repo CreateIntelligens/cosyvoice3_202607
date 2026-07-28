@@ -56,3 +56,6 @@ reports/
 
 # Local container workspace: copied smoke data, models, parquet and checkpoints.
 /workspace/
+
+# Test-bench models: symlinks and multi-GB checkpoints, never committed.
+models/

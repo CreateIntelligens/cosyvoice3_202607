@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CosyVoice3 台語模型試聽台</title>
+<style>
+  :root {
+    --bg: #12141a; --panel: #1a1d26; --line: #2a2f3d; --ink: #e6e8ee;
+    --muted: #8b93a7; --accent: #6ea8fe; --ok: #4ec9a5; --warn: #e6a23c;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+         font: 15px/1.6 system-ui, "Noto Sans TC", sans-serif; }
+  header { padding: 20px 24px; border-bottom: 1px solid var(--line); }
+  h1 { margin: 0; font-size: 19px; font-weight: 600; }
+  .sub { color: var(--muted); font-size: 13px; margin-top: 4px; }
+  main { display: grid; grid-template-columns: 400px 1fr; gap: 20px; padding: 20px 24px; align-items: start; }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 18px; }
+  label { display: block; font-size: 12px; color: var(--muted); margin: 14px 0 5px; letter-spacing: .02em; }
+  label:first-child { margin-top: 0; }
+  select, textarea, input[type=text], input[type=number] {
+    width: 100%; background: #0e1016; color: var(--ink); border: 1px solid var(--line);
+    border-radius: 7px; padding: 9px 10px; font: inherit; font-size: 14px;
+  }
+  textarea { resize: vertical; min-height: 74px; }
+  button { background: var(--accent); color: #0b0d12; border: 0; border-radius: 7px;
+           padding: 11px 16px; font: inherit; font-weight: 600; cursor: pointer; width: 100%; margin-top: 18px; }
+  button:disabled { opacity: .5; cursor: default; }
+  button.ghost { background: transparent; color: var(--muted); border: 1px solid var(--line);
+                 width: auto; padding: 6px 12px; margin: 0; font-weight: 400; font-size: 13px; }
+  .row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .hint { font-size: 12px; color: var(--muted); margin-top: 6px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+          padding: 14px 16px; margin-bottom: 12px; }
+  .card h3 { margin: 0 0 4px; font-size: 14px; font-weight: 600; }
+  .tags { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; }
+  .tag { font-size: 11px; padding: 2px 8px; border-radius: 20px;
+         background: #232838; color: var(--muted); border: 1px solid var(--line); }
+  .tag.b { color: var(--accent); border-color: #2f4straight; }
+  audio { width: 100%; margin-top: 8px; }
+  .empty { color: var(--muted); text-align: center; padding: 48px 20px; }
+  .err { color: #ff8f8f; }
+  .status { font-size: 12px; color: var(--muted); margin-top: 10px; min-height: 18px; }
+  .head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>CosyVoice3 台語模型試聽台</h1>
+  <div class="sub" id="health">載入中…</div>
+</header>
+
+<main>
+  <section class="panel">
+    <label>LLM</label>
+    <select id="llm"></select>
+
+    <label>Flow</label>
+    <select id="flow"></select>
+
+    <label>HiFi-GAN (hift)</label>
+    <select id="hift"></select>
+
+    <label>華語文字</label>
+    <textarea id="text">明天早上九點，我們一起去市場買東西。</textarea>
+
+    <label>Instruction（訓練與推論必須一致）</label>
+    <textarea id="instruct"></textarea>
+
+    <label>音色來源</label>
+    <select id="prompt_name"></select>
+    <div class="hint">或上傳自己的參考音檔（會覆蓋上面的選擇）</div>
+    <input type="file" id="prompt_wav" accept="audio/*" style="margin-top:6px">
+
+    <div class="row">
+      <div>
+        <label>語速</label>
+        <input type="number" id="speed" value="1.0" step="0.05" min="0.5" max="2.0">
+      </div>
+      <div>
+        <label>文字正規化</label>
+        <select id="text_frontend">
+          <option value="false" selected>關閉（建議）</option>
+          <option value="true">開啟</option>
+        </select>
+      </div>
+    </div>
+
+    <button id="go">合成</button>
+    <div class="status" id="status"></div>
+  </section>
+
+  <section>
+    <div class="head">
+      <div class="sub">結果（新的在最上面，可互相比較）</div>
+      <button class="ghost" id="clear">清除</button>
+    </div>
+    <div id="results"><div class="empty">還沒有結果</div></div>
+  </section>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+let meta = null;
+
+function fill(sel, items, preferred) {
+  sel.innerHTML = "";
+  items.forEach(v => {
+    const o = document.createElement("option");
+    o.value = v;
+    o.textContent = v === "official" ? "official（原始模型）" : v;
+    sel.appendChild(o);
+  });
+  if (preferred && items.includes(preferred)) sel.value = preferred;
+}
+
+async function init() {
+  try {
+    const [v, h] = await Promise.all([
+      fetch("/api/variants").then(r => r.json()),
+      fetch("/api/health").then(r => r.json()),
+    ]);
+    meta = v;
+    fill($("llm"), v.parts.llm, "llm_best");
+    fill($("flow"), v.parts.flow, "flow_best");
+    fill($("hift"), v.parts.hift, "official");
+    $("instruct").value = v.default_instruct;
+
+    $("prompt_name").innerHTML = "";
+    if (v.prompts.length === 0) {
+      const o = document.createElement("option");
+      o.value = ""; o.textContent = "（沒有預設音色，請上傳）";
+      $("prompt_name").appendChild(o);
+    } else {
+      v.prompts.forEach(p => {
+        const o = document.createElement("option");
+        o.value = p; o.textContent = p;
+        $("prompt_name").appendChild(o);
+      });
+    }
+
+    const bits = [h.cuda ? `GPU: ${h.device}` : "⚠️ 沒有 CUDA，會非常慢"];
+    if (!v.base_present) bits.push("⚠️ 找不到官方模型");
+    bits.push(`可選 checkpoint — llm ${v.parts.llm.length} / flow ${v.parts.flow.length} / hift ${v.parts.hift.length}`);
+    $("health").textContent = bits.join("　·　");
+    if (!h.cuda || !v.base_present) $("health").classList.add("err");
+  } catch (e) {
+    $("health").textContent = "無法連線到後端：" + e;
+    $("health").classList.add("err");
+  }
+}
+
+$("go").onclick = async () => {
+  const text = $("text").value.trim();
+  if (!text) { $("status").textContent = "請先輸入文字"; return; }
+  const file = $("prompt_wav").files[0];
+  if (!file && !$("prompt_name").value) { $("status").textContent = "請選擇或上傳音色來源"; return; }
+
+  const fd = new FormData();
+  fd.append("text", text);
+  fd.append("llm", $("llm").value);
+  fd.append("flow", $("flow").value);
+  fd.append("hift", $("hift").value);
+  fd.append("instruct", $("instruct").value);
+  fd.append("speed", $("speed").value);
+  fd.append("text_frontend", $("text_frontend").value);
+  if (file) fd.append("prompt_wav", file);
+  else fd.append("prompt_name", $("prompt_name").value);
+
+  $("go").disabled = true;
+  const started = performance.now();
+  $("status").textContent = "合成中…（切換 checkpoint 時要重新載入模型，第一次會比較久）";
+  try {
+    const res = await fetch("/api/tts", { method: "POST", body: fd });
+    if (!res.ok) throw new Error((await res.text()) || res.statusText);
+    const blob = await res.blob();
+    addResult({
+      url: URL.createObjectURL(blob),
+      llm: $("llm").value, flow: $("flow").value, hift: $("hift").value,
+      text, elapsed: ((performance.now() - started) / 1000).toFixed(1),
+      duration: res.headers.get("X-Duration-Sec"),
+      prompt: file ? file.name : $("prompt_name").value,
+    });
+    $("status").textContent = "";
+  } catch (e) {
+    $("status").innerHTML = `<span class="err">失敗：${e.message}</span>`;
+  } finally {
+    $("go").disabled = false;
+  }
+};
+
+function addResult(r) {
+  const empty = document.querySelector("#results .empty");
+  if (empty) empty.remove();
+  const el = document.createElement("div");
+  el.className = "card";
+  el.innerHTML = `
+    <h3>${escapeHtml(r.text)}</h3>
+    <div class="tags">
+      <span class="tag b">llm: ${r.llm}</span>
+      <span class="tag b">flow: ${r.flow}</span>
+      <span class="tag b">hift: ${r.hift}</span>
+      <span class="tag">音色: ${escapeHtml(r.prompt)}</span>
+      <span class="tag">長度 ${r.duration}s</span>
+      <span class="tag">耗時 ${r.elapsed}s</span>
+    </div>
+    <audio controls src="${r.url}"></audio>`;
+  $("results").prepend(el);
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+$("clear").onclick = () => { $("results").innerHTML = '<div class="empty">還沒有結果</div>'; };
+
+init();
+</script>
+</body>
+</html>

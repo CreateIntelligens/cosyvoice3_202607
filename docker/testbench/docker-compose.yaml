@@ -1,0 +1,43 @@
+# Listen to Taigi checkpoints side by side against the official model.
+#
+#   cd docker/testbench && docker compose up -d && docker compose logs -f
+#
+# Ports 50001 and 8085 already belong to the ai-virtual-human stack on this host,
+# so this one sits on 50010.
+services:
+  testbench:
+    image: happy74527/cosyvoice3-taipei1:latest
+    container_name: cosyvoice3-testbench
+    working_dir: /app
+    command: python /app/server.py
+    environment:
+      PORT: "50010"
+      MODELS_ROOT: /models
+      COSYVOICE_ROOT: /opt/CosyVoice
+      PYTHONUNBUFFERED: "1"
+    # This host already runs 55 containers across 33 bridge networks and Docker's
+    # default address pools are exhausted, so creating another one fails. Host
+    # networking sidesteps it; the server binds 0.0.0.0:50010 itself.
+    network_mode: host
+    volumes:
+      - ./app:/app:ro
+      # The image ships the code from commit 7526c48; mount the working tree so
+      # the flow/dataset/average_model fixes apply without rebuilding 21 GB.
+      - ../..:/opt/CosyVoice:ro
+      - ${MODELS_DIR:-../../models}:/models:ro
+      # base/ is the official model and lives outside the repo, so a symlink under
+      # models/ would dangle inside the container. Mount the real directory on top.
+      - ${BASE_MODEL_DIR:-../../workspace/cosyvoice3_smoke_10spk/models/Fun-CosyVoice3-0.5B}:/models/base:ro
+      - testbench-variants:/tmp/cosyvoice-variants
+    shm_size: "8gb"
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+volumes:
+  testbench-variants:
