@@ -39,12 +39,29 @@
   .tag { font-size: 11px; padding: 2px 8px; border-radius: 20px;
          background: #232838; color: var(--muted); border: 1px solid var(--line); }
   .tag.b { color: var(--accent); border-color: #33415c; }
+  .tag.up { color: #9fdcb4; border-color: #4a7c59; }
   .tag.seed { cursor: pointer; color: var(--ok); border-color: #2d5548; }
   .tag.seed:hover { background: #2d5548; color: #eafff8; }
   audio { width: 100%; margin-top: 8px; }
   .empty { color: var(--muted); text-align: center; padding: 48px 20px; }
   .err { color: #ff8f8f; }
   .status { font-size: 12px; color: var(--muted); margin-top: 10px; min-height: 18px; }
+  .uprow { display: flex; gap: 8px; align-items: center; margin-top: 6px; }
+  .filebtn { flex: 1; display: block; text-align: center; cursor: pointer; margin: 0;
+             background: transparent; color: var(--ink); border: 1px dashed var(--line);
+             border-radius: 7px; padding: 9px 12px; font-size: 13px; letter-spacing: 0;
+             overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .filebtn:hover { border-color: var(--accent); color: var(--accent); }
+  .filebtn.has { border-style: solid; border-color: #4a7c59; color: #9fdcb4; background: #16241c; }
+  #src_preview { margin-top: 8px; height: 34px; }
+  .active-src { margin-top: 10px; padding: 8px 11px; border-radius: 7px; font-size: 12px;
+                border: 1px solid var(--line); background: #0e1016; color: var(--muted); }
+  .active-src b { color: var(--ink); font-weight: 600; }
+  .active-src.upload { border-color: #4a7c59; background: #16241c; color: #9fdcb4; }
+  .active-src.upload b { color: #d6ffe6; }
+  .active-src.bad { border-color: #7c4a4a; background: #241618; color: #ffb3b3; }
+  .active-src.bad b { color: #ffd6d6; }
+  select:disabled { opacity: .38; }
   .head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
 </style>
 </head>
@@ -73,8 +90,14 @@
 
     <label>音色來源</label>
     <select id="prompt_name"></select>
-    <div class="hint">或上傳自己的參考音檔（會覆蓋上面的選擇）</div>
-    <input type="file" id="prompt_wav" accept="audio/*" style="margin-top:6px">
+    <div class="hint">或上傳自己的參考音檔（上傳後會蓋過上面的選擇）</div>
+    <div class="uprow">
+      <input type="file" id="prompt_wav" accept="audio/*" hidden>
+      <label for="prompt_wav" class="filebtn" id="filebtn_label">選擇音檔…</label>
+      <button class="ghost" id="clear_upload" hidden>取消上傳</button>
+    </div>
+    <div class="active-src" id="active_src"></div>
+    <audio id="src_preview" controls preload="none"></audio>
 
     <div class="row">
       <div>
@@ -90,8 +113,12 @@
       </div>
     </div>
 
-    <label>Seed（留空或 -1 = 每次隨機；固定同一個值可重現同樣的結果）</label>
-    <input type="number" id="seed" value="-1" step="1">
+    <label>Seed</label>
+    <div class="row">
+      <input type="number" id="seed" value="-1" step="1" min="-1" max="2147483647">
+      <button class="ghost" id="reroll" style="width:100%">隨機</button>
+    </div>
+    <div class="hint">-1 = 每次隨機。填 0–2147483647 可重現同一結果，方便比較不同 checkpoint。</div>
 
     <button id="go">合成</button>
     <div class="status" id="status"></div>
@@ -151,6 +178,7 @@ async function init() {
     bits.push(`可選 checkpoint — llm ${v.parts.llm.length} / flow ${v.parts.flow.length} / hift ${v.parts.hift.length}`);
     $("health").textContent = bits.join("　·　");
     if (!h.cuda || !v.base_present) $("health").classList.add("err");
+    refreshSource();
   } catch (e) {
     $("health").textContent = "無法連線到後端：" + e;
     $("health").classList.add("err");
@@ -163,6 +191,15 @@ $("go").onclick = async () => {
   const file = $("prompt_wav").files[0];
   if (!file && !$("prompt_name").value) { $("status").textContent = "請選擇或上傳音色來源"; return; }
 
+  if (srcSeconds != null && srcSeconds > MAX_PROMPT_SEC) {
+    $("status").innerHTML = `<span class="err">參考音檔 ${srcSeconds.toFixed(1)} 秒，超過 ${MAX_PROMPT_SEC} 秒上限，請先裁切（建議 3–10 秒）</span>`;
+    return;
+  }
+  if (srcSeconds != null && srcSeconds < MIN_PROMPT_SEC) {
+    $("status").innerHTML = `<span class="err">參考音檔只有 ${srcSeconds.toFixed(2)} 秒，太短不足以描述音色</span>`;
+    return;
+  }
+
   const fd = new FormData();
   fd.append("text", text);
   fd.append("llm", $("llm").value);
@@ -171,7 +208,13 @@ $("go").onclick = async () => {
   fd.append("instruct", $("instruct").value);
   fd.append("speed", $("speed").value);
   fd.append("text_frontend", $("text_frontend").value);
-  fd.append("seed", $("seed").value === "" ? "-1" : $("seed").value);
+  const rawSeed = $("seed").value.trim();
+  const seedNum = rawSeed === "" ? -1 : Number(rawSeed);
+  if (!Number.isInteger(seedNum) || seedNum < -1 || seedNum > 2147483647) {
+    $("status").innerHTML = '<span class="err">seed 必須是 -1 或 0–2147483647 的整數</span>';
+    return;
+  }
+  fd.append("seed", String(seedNum));
   if (file) fd.append("prompt_wav", file);
   else fd.append("prompt_name", $("prompt_name").value);
 
@@ -180,7 +223,11 @@ $("go").onclick = async () => {
   $("status").textContent = "合成中…（切換 checkpoint 時要重新載入模型，第一次會比較久）";
   try {
     const res = await fetch("/api/tts", { method: "POST", body: fd });
-    if (!res.ok) throw new Error((await res.text()) || res.statusText);
+    if (!res.ok) {
+      let msg = res.statusText;
+      try { msg = (await res.json()).detail || msg; } catch (_) { }
+      throw new Error(msg);
+    }
     const blob = await res.blob();
     addResult({
       url: URL.createObjectURL(blob),
@@ -189,6 +236,7 @@ $("go").onclick = async () => {
       duration: res.headers.get("X-Duration-Sec"),
       seed: res.headers.get("X-Seed"),
       prompt: file ? file.name : $("prompt_name").value,
+      uploaded: !!file,
     });
     $("status").textContent = "";
   } catch (e) {
@@ -209,7 +257,7 @@ function addResult(r) {
       <span class="tag b">llm: ${r.llm}</span>
       <span class="tag b">flow: ${r.flow}</span>
       <span class="tag b">hift: ${r.hift}</span>
-      <span class="tag">音色: ${escapeHtml(r.prompt)}</span>
+      <span class="tag${r.uploaded ? " up" : ""}">音色: ${r.uploaded ? "⬆ " : ""}${escapeHtml(r.prompt)}</span>
       <span class="tag">長度 ${r.duration}s</span>
       <span class="tag">耗時 ${r.elapsed}s</span>
       <span class="tag seed" data-seed="${r.seed}" title="點一下沿用這個 seed">seed ${r.seed}</span>
@@ -222,6 +270,64 @@ function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, c =>
     ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
+
+let previewUrl = null;
+let srcSeconds = null;      // 目前音色來源的長度，null 表示還沒量到
+const MAX_PROMPT_SEC = 30, MIN_PROMPT_SEC = 1;
+
+function describeLen(sec) {
+  if (sec == null) return "";
+  if (sec > MAX_PROMPT_SEC) return ` — <span class="err">${sec.toFixed(1)} 秒，超過 ${MAX_PROMPT_SEC} 秒上限</span>`;
+  if (sec < MIN_PROMPT_SEC) return ` — <span class="err">只有 ${sec.toFixed(2)} 秒，太短</span>`;
+  return ` — ${sec.toFixed(1)} 秒`;
+}
+
+function refreshSource() {
+  const f = $("prompt_wav").files[0];
+  const box = $("active_src"), btn = $("filebtn_label"), audio = $("src_preview");
+  $("prompt_name").disabled = !!f;
+  $("clear_upload").hidden = !f;
+  // 每次換來源都要釋放上一個 object URL，否則 blob 會一直留在記憶體
+  if (previewUrl) { URL.revokeObjectURL(previewUrl); previewUrl = null; }
+  if (f) {
+    btn.textContent = "⬆ " + f.name;
+    btn.classList.add("has");
+    box.className = "active-src upload";
+    box.innerHTML = `目前使用<b>上傳的檔案</b>：<b>${escapeHtml(f.name)}</b>（下拉選單已停用）`;
+    previewUrl = URL.createObjectURL(f);
+    audio.src = previewUrl;
+    audio.hidden = false;
+    srcSeconds = null;
+    audio.onloadedmetadata = () => {
+      srcSeconds = audio.duration;
+      box.innerHTML = `目前使用<b>上傳的檔案</b>：<b>${escapeHtml(f.name)}</b>${describeLen(srcSeconds)}`;
+      if (srcSeconds > MAX_PROMPT_SEC) box.classList.add("bad");
+      else box.classList.remove("bad");
+    };
+  } else {
+    btn.textContent = "選擇音檔…";
+    btn.classList.remove("has");
+    box.className = "active-src";
+    const v = $("prompt_name").value;
+    box.innerHTML = v ? `目前使用預設音色：<b>${escapeHtml(v)}</b>`
+                      : "尚未選擇音色，請從上方挑一個或上傳檔案";
+    box.classList.remove("bad");
+    srcSeconds = null;
+    if (v) {
+      audio.src = "/api/prompt/" + encodeURIComponent(v);
+      audio.hidden = false;
+      audio.onloadedmetadata = () => {
+        srcSeconds = audio.duration;
+        box.innerHTML = `目前使用預設音色：<b>${escapeHtml(v)}</b>${describeLen(srcSeconds)}`;
+      };
+    } else { audio.removeAttribute("src"); audio.hidden = true; }
+  }
+}
+$("prompt_wav").addEventListener("change", refreshSource);
+$("prompt_name").addEventListener("change", refreshSource);
+$("clear_upload").onclick = () => { $("prompt_wav").value = ""; refreshSource(); };
+
+$("reroll").onclick = () => { $("seed").value = "-1"; $("status").textContent = "下一次會用隨機 seed"; };
 
 $("results").addEventListener("click", e => {
   const t = e.target.closest(".tag.seed");

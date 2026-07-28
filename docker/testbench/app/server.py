@@ -20,10 +20,11 @@ import sys
 import threading
 from pathlib import Path
 
+import soundfile as sf
 import torch
 import torchaudio
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -45,6 +46,13 @@ STATIC_DIR = Path(__file__).parent / "static"
 
 PARTS = ("llm", "flow", "hift")
 OFFICIAL = "official"
+# torch accepts a much wider range, but 32-bit keeps the value short enough to
+# quote in a bug report and matches what the UI offers.
+MAX_SEED = 2 ** 31 - 1
+# frontend.py asserts this before extracting speech tokens; catching it here turns
+# an opaque 500 into something the caller can act on.
+MAX_PROMPT_SEC = 30.0
+MIN_PROMPT_SEC = 1.0
 DEFAULT_INSTRUCT = "You are a helpful assistant. 請將輸入的華語翻譯成自然的臺灣台語並朗讀。<|endofprompt|>"
 
 app = FastAPI(title="CosyVoice3 checkpoint testbench")
@@ -63,7 +71,7 @@ def apply_seed(seed: int) -> int:
     enough to make a given (checkpoints, text, prompt, seed) reproduce exactly.
     """
     if seed < 0:
-        seed = random.randrange(2 ** 31 - 1)
+        seed = random.randrange(MAX_SEED)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
@@ -126,6 +134,8 @@ def variants():
         "loaded": list(_loaded) if _loaded else None,
         "default_instruct": DEFAULT_INSTRUCT,
         "base_present": BASE_DIR.is_dir(),
+        "max_prompt_sec": MAX_PROMPT_SEC,
+        "min_prompt_sec": MIN_PROMPT_SEC,
     }
 
 
@@ -159,6 +169,8 @@ def tts(
 ):
     if not BASE_DIR.is_dir():
         raise HTTPException(503, f"official model not found under {BASE_DIR}")
+    if seed < -1 or seed > MAX_SEED:
+        raise HTTPException(400, f"seed must be -1 (random) or 0..{MAX_SEED}, got {seed}")
     # The frontend re-reads the prompt three times (mel at 24k, speech token, and
     # speaker embedding at 16k), so it needs a seekable path — a BytesIO would be
     # empty after the first read.
@@ -175,9 +187,30 @@ def tts(
         raise HTTPException(400, "provide prompt_wav or prompt_name")
 
     try:
+        try:
+            info = sf.info(str(source))
+            duration = info.frames / info.samplerate
+        except Exception:
+            duration = None  # 讓模型自己去報，不要因為讀不到長度就擋下
+        if duration is not None:
+            if duration > MAX_PROMPT_SEC:
+                raise HTTPException(
+                    400,
+                    f"參考音檔長度 {duration:.1f} 秒，超過上限 {MAX_PROMPT_SEC:.0f} 秒。"
+                    f"請裁切到 {MAX_PROMPT_SEC:.0f} 秒以內（建議 3–10 秒）。",
+                )
+            if duration < MIN_PROMPT_SEC:
+                raise HTTPException(
+                    400, f"參考音檔只有 {duration:.2f} 秒，太短不足以描述音色，請用 3 秒以上。"
+                )
+
         with _lock:
             model = get_model(llm, flow, hift)
             used_seed = apply_seed(seed)
+            log.info(
+                "tts seed=%d llm=%s flow=%s hift=%s prompt=%s speed=%s text=%r",
+                used_seed, llm, flow, hift, Path(source).name, speed, text[:60],
+            )
             chunks = [
                 out["tts_speech"]
                 for out in model.inference_instruct2(
@@ -205,6 +238,13 @@ def tts(
             "Access-Control-Expose-Headers": "X-Variant, X-Duration-Sec, X-Seed",
         },
     )
+
+
+@app.exception_handler(Exception)
+async def unhandled(request, exc):
+    """Surface the real message; the default 500 body says nothing useful."""
+    log.exception("request failed")
+    return JSONResponse(status_code=500, content={"detail": f"{type(exc).__name__}: {exc}"})
 
 
 @app.get("/api/prompt/{name}")
