@@ -147,7 +147,11 @@ def Dataset(data_list_file,
     # map partial arg to padding func
     for i in range(1, len(data_pipeline)):
         if data_pipeline[i].func.__name__ == 'compute_fbank' and gan is True:
-            data_pipeline[i] = partial(data_pipeline[i], token_mel_ratio=0)
+            # compute_fbank used to take token_mel_ratio; the knob that pads speech
+            # up to a token boundary is now num_frames, and GAN training does not
+            # want that padding. truncate already fixes every clip to a multiple of
+            # num_frames, so this only restores the intended "off" setting.
+            data_pipeline[i] = partial(data_pipeline[i], num_frames=-1)
         if data_pipeline[i].func.__name__ == 'padding':
             data_pipeline[i] = partial(data_pipeline[i], gan=gan, dpo=dpo)
     for func in data_pipeline:
