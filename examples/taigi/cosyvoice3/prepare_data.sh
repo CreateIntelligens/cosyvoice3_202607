@@ -35,6 +35,15 @@ if (( stage <= 0 && stop_stage >= 0 )); then
     --container-output-root "${prepared_dir}"
     --seed 1986
   )
+  # NAER/TAT-MOE is optional and shaped differently: speakers hold WAVs directly and
+  # the transcripts live in metadata.jsonl rather than beside each clip.
+  if [[ -n "${NAER_ROOT:-}" ]]; then
+    common_args+=(
+      --source "naer=${NAER_ROOT}"
+      --container-source "naer=${NAER_ROOT}"
+      --transcript-jsonl "naer=${NAER_JSONL:?NAER_ROOT set without NAER_JSONL}:${NAER_JSONL_ROOT:?NAER_ROOT set without NAER_JSONL_ROOT}"
+    )
+  fi
   if [[ -f "${qc_root}/drama1_audio_qc_full.json" && -f "${qc_root}/drama2_audio_qc_full.json" ]]; then
     common_args+=(
       --qc-report "drama1=${qc_root}/drama1_audio_qc_full.json"

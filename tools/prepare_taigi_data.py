@@ -63,6 +63,31 @@ def parse_speaker_lists(values: list[str]) -> dict[str, list[str]]:
     return {name: [item for item in value.split(",") if item] for name, value in parsed.items()}
 
 
+def load_transcripts(values: list[str]) -> dict[str, dict[Path, str]]:
+    """Read texts from a corpus index instead of a .normalized.txt beside each WAV.
+
+    Accepts NAME=JSONL:ROOT where the jsonl carries {"audio": ..., "text": ...} with
+    audio relative to ROOT. NAER keeps its transcripts in metadata.jsonl and has no
+    per-clip text files.
+    """
+    out: dict[str, dict[Path, str]] = {}
+    for value in values:
+        name, _, spec = value.partition("=")
+        jsonl, _, root = spec.partition(":")
+        if not name or not jsonl or not root:
+            raise ValueError(f"--transcript-jsonl expects NAME=JSONL:ROOT, got {value}")
+        base = Path(root).resolve()
+        mapping: dict[Path, str] = {}
+        with Path(jsonl).open("r", encoding="utf-8") as stream:
+            for line in stream:
+                record = json.loads(line)
+                text = " ".join(str(record.get("text", "")).split())
+                if text:
+                    mapping[(base / record["audio"]).resolve()] = text
+        out[name] = mapping
+    return out
+
+
 def load_qc_exclusions(values: list[str]) -> dict[str, set[str]]:
     reports = parse_mapping(values, "--qc-report")
     exclusions: dict[str, set[str]] = {}
@@ -103,6 +128,7 @@ def scan_candidates(
     excluded: set[str],
     min_duration: float,
     max_duration: float,
+    transcripts: dict[Path, str] | None = None,
 ) -> tuple[list[Candidate], dict[str, int]]:
     candidates: list[Candidate] = []
     counters: defaultdict[str, int] = defaultdict(int)
@@ -117,10 +143,16 @@ def scan_candidates(
                 counters["qc_excluded"] += 1
                 continue
             transcript_path = wav_path.with_suffix(".normalized.txt")
-            if not transcript_path.is_file():
+            if transcripts is not None:
+                transcript = transcripts.get(wav_path.resolve(), "")
+                if not transcript:
+                    counters["missing_transcript"] += 1
+                    continue
+            elif not transcript_path.is_file():
                 counters["missing_transcript"] += 1
                 continue
-            transcript = " ".join(transcript_path.read_text(encoding="utf-8").split())
+            else:
+                transcript = " ".join(transcript_path.read_text(encoding="utf-8").split())
             if not transcript:
                 counters["empty_transcript"] += 1
                 continue
@@ -134,7 +166,10 @@ def scan_candidates(
                 continue
 
             speaker_id = f"{source}-{raw_speaker}"
-            utterance_id = f"{source}-{wav_path.stem}"
+            # The stem alone is not unique in every corpus: NAER reuses prompt-card
+            # names such as A025-1.1.wav across speakers. The relative path is unique
+            # by construction.
+            utterance_id = "{}-{}".format(source, relative_wav.with_suffix("").as_posix().replace("/", "_"))
             if utterance_id in seen_utterances:
                 raise ValueError(f"duplicate utterance ID {utterance_id}; source path: {wav_path}")
             seen_utterances.add(utterance_id)
@@ -278,7 +313,12 @@ def materialize_files(temp_root: Path, candidates: list[Candidate], copy_workers
         destination_txt = destination_wav.with_suffix(".normalized.txt")
         destination_wav.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(candidate.source_root / candidate.relative_wav, destination_wav)
-        shutil.copy2(candidate.transcript_path, destination_txt)
+        if candidate.transcript_path.is_file():
+            shutil.copy2(candidate.transcript_path, destination_txt)
+        else:
+            # Sources indexed by --transcript-jsonl have no per-clip text file; write
+            # the text we resolved so the materialised tree is self-contained.
+            destination_txt.write_text(candidate.transcript + "\n", encoding="utf-8")
 
     with ThreadPoolExecutor(max_workers=copy_workers) as executor:
         list(executor.map(copy_candidate, candidates))
@@ -292,6 +332,7 @@ def main() -> None:
     parser.add_argument("--holdout-speakers", action="append", default=[], metavar="NAME=ID,ID")
     parser.add_argument("--speakers-per-source", type=int, default=0)
     parser.add_argument("--qc-report", action="append", default=[], metavar="NAME=PATH")
+    parser.add_argument("--transcript-jsonl", action="append", default=[], metavar="NAME=JSONL:ROOT")
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--container-output-root", required=True)
     parser.add_argument("--materialize", choices=("copy", "none"), default="none")
@@ -311,6 +352,7 @@ def main() -> None:
     explicit_speakers = parse_speaker_lists(args.speaker_list)
     holdout_speakers = parse_speaker_lists(args.holdout_speakers)
     exclusions = load_qc_exclusions(args.qc_report)
+    transcripts = load_transcripts(args.transcript_jsonl)
     ratios = (args.train_ratio, args.dev_ratio, args.test_ratio)
     if any(ratio < 0 for ratio in ratios) or abs(sum(ratios) - 1.0) > 1e-8:
         raise ValueError("train/dev/test ratios must be non-negative and sum to 1")
@@ -342,6 +384,7 @@ def main() -> None:
             exclusions.get(source, set()),
             args.min_duration,
             args.max_duration,
+            transcripts.get(source),
         )
         all_candidates.extend(candidates)
         scan_summary[source] = counters
