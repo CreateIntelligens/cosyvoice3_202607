@@ -12,7 +12,7 @@
 #SBATCH --cpus-per-task=32
 #SBATCH --time=24:00:00
 #SBATCH --job-name=cosyvoice3-taigi-prep
-#SBATCH --output=/mnt/shared/p06/cosyvoice/logs/%x-%j.out
+#SBATCH --output=slurm-%x-%j.out
 
 set -euo pipefail
 

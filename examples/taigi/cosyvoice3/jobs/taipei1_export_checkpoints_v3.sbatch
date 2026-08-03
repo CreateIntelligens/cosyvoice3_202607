@@ -11,8 +11,7 @@
 #SBATCH --cpus-per-task=16
 #SBATCH --time=02:00:00
 #SBATCH --job-name=cosyvoice3-taigi-export-v3
-#SBATCH --output=/mnt/shared/p06/cosyvoice/logs/%x-%j.out
-#SBATCH --error=/mnt/shared/p06/cosyvoice/logs/%x-%j.err
+#SBATCH --output=slurm-%x-%j.out
 
 set -euo pipefail
 
@@ -22,7 +21,7 @@ set -euo pipefail
 mkdir -p "${TP1_WORKSPACE}/export"
 
 tp1_mounts="${TP1_WORKSPACE}:/workspace"
-patch=/mnt/shared/p06/cosyvoice/patches/average_model.py
+patch="${TP1_PATCH_DIR:-/mnt/shared/p06/cosyvoice/patches}/average_model.py"
 [[ -s "${patch}" ]] && tp1_mounts="${tp1_mounts},${patch}:/opt/CosyVoice/cosyvoice/bin/average_model.py:ro"
 
 srun --container-image "${TP1_IMAGE}" --container-mounts "${tp1_mounts}" bash -c '
