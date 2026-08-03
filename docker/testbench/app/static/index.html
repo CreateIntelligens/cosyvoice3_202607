@@ -63,6 +63,12 @@
   .active-src.bad b { color: #ffd6d6; }
   select:disabled { opacity: .38; }
   .head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+  /* 要唸的文字和 instruction 原本是兩個一模一樣的方塊，很容易貼錯欄位 */
+  .lblrow { display: flex; justify-content: space-between; align-items: center; gap: 10px; }
+  button.ghost.tiny { padding: 3px 9px; font-size: 11px; }
+  textarea.secondary { min-height: 52px; font-size: 12px; color: var(--muted); background: #0b0d12; }
+  textarea.secondary:focus { color: var(--ink); }
+  .hint.warn { color: #ffcf8f; }
 </style>
 </head>
 <body>
@@ -85,8 +91,12 @@
     <label>華語文字</label>
     <textarea id="text">明天早上九點，我們一起去市場買東西。</textarea>
 
-    <label>Instruction（訓練與推論必須一致）</label>
-    <textarea id="instruct"></textarea>
+    <label class="lblrow">
+      <span>Instruction（訓練與推論必須一致，通常不用改）</span>
+      <button type="button" class="ghost tiny" id="instr_reset">復原預設</button>
+    </label>
+    <textarea id="instruct" class="secondary" spellcheck="false"></textarea>
+    <div class="hint" id="instr_warn" hidden></div>
 
     <label>音色來源</label>
     <select id="prompt_name"></select>
@@ -137,6 +147,28 @@
 const $ = id => document.getElementById(id);
 let meta = null;
 
+let DEFAULT_INSTRUCT = "";
+
+// Instruction 少了 <|endofprompt|> 時後端會自動補上，所以不會壞；但如果是把要唸的
+// 句子誤貼到這裡，補完照樣會合成出莫名其妙的東西，所以在送出前先提醒。
+function checkInstruct() {
+  const box = $("instruct"), warn = $("instr_warn");
+  const v = box.value.trim();
+  let msg = "";
+  if (!v) {
+    msg = "空白，送出時會用預設值。";
+  } else if (!v.includes("<|endofprompt|>")) {
+    msg = v.length > 60
+      ? "這段看起來像要唸的內容，不是 instruction。要唸的文字請放上面的「華語文字」欄位。"
+      : "缺少 <|endofprompt|>，送出時會自動補上。";
+  } else if (DEFAULT_INSTRUCT && v !== DEFAULT_INSTRUCT.trim()) {
+    msg = "已偏離預設值。instruction 必須和訓練時一致，否則輸出會退化。";
+  }
+  warn.textContent = msg;
+  warn.hidden = !msg;
+  warn.className = msg ? "hint warn" : "hint";
+}
+
 function fill(sel, items, preferred) {
   sel.innerHTML = "";
   items.forEach(v => {
@@ -159,6 +191,8 @@ async function init() {
     fill($("flow"), v.parts.flow, "flow_best");
     fill($("hift"), v.parts.hift, "official");
     $("instruct").value = v.default_instruct;
+    DEFAULT_INSTRUCT = v.default_instruct;
+    checkInstruct();
 
     $("prompt_name").innerHTML = "";
     if (v.prompts.length === 0) {
@@ -328,6 +362,9 @@ $("prompt_name").addEventListener("change", refreshSource);
 $("clear_upload").onclick = () => { $("prompt_wav").value = ""; refreshSource(); };
 
 $("reroll").onclick = () => { $("seed").value = "-1"; $("status").textContent = "下一次會用隨機 seed"; };
+
+$("instruct").addEventListener("input", checkInstruct);
+$("instr_reset").onclick = () => { $("instruct").value = DEFAULT_INSTRUCT; checkInstruct(); };
 
 $("results").addEventListener("click", e => {
   const t = e.target.closest(".tag.seed");

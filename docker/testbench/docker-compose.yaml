@@ -15,6 +15,12 @@ services:
       MODELS_ROOT: /models
       COSYVOICE_ROOT: /opt/CosyVoice
       PYTHONUNBUFFERED: "1"
+      # This 20 GB card is shared with serve-tts-1, indextts-service and
+      # sensevoice-service, which between them hold ~14 GB. Repeatedly loading and
+      # releasing checkpoints fragments what little is left, so long inputs OOM on
+      # allocations as small as 12 MiB. Expandable segments let the allocator grow a
+      # region instead of hunting for a contiguous free block.
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
     # This host already runs 55 containers across 33 bridge networks and Docker's
     # default address pools are exhausted, so creating another one fails. Host
     # networking sidesteps it; the server binds 0.0.0.0:50010 itself.

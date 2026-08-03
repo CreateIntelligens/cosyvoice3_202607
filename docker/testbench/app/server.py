@@ -53,7 +53,10 @@ MAX_SEED = 2 ** 31 - 1
 # an opaque 500 into something the caller can act on.
 MAX_PROMPT_SEC = 30.0
 MIN_PROMPT_SEC = 1.0
-DEFAULT_INSTRUCT = "You are a helpful assistant. 請將輸入的華語翻譯成自然的臺灣台語並朗讀。<|endofprompt|>"
+# CosyVoice3 tokenises this to id 151646 and asserts on its presence; without it the
+# LLM thread dies before emitting a single token.
+END_OF_PROMPT = "<|endofprompt|>"
+DEFAULT_INSTRUCT = f"You are a helpful assistant. 請將輸入的華語翻譯成自然的臺灣台語並朗讀。{END_OF_PROMPT}"
 
 app = FastAPI(title="CosyVoice3 checkpoint testbench")
 
@@ -176,6 +179,18 @@ def tts(
         raise HTTPException(503, f"official model not found under {BASE_DIR}")
     if seed < -1 or seed > MAX_SEED:
         raise HTTPException(400, f"seed must be -1 (random) or 0..{MAX_SEED}, got {seed}")
+
+    # Form(DEFAULT_INSTRUCT) only fires when the field is absent, but the page always
+    # sends it — so an emptied textarea arrives as "" and CosyVoice3 then dies deep
+    # inside the LLM thread on `assert 151646 in text`, surfacing as an unrelated
+    # "Input and output sizes should be greater than 0". Normalise it here instead.
+    instruct = instruct.strip()
+    if not instruct:
+        instruct = DEFAULT_INSTRUCT
+        log.info("instruct was blank, using the default")
+    elif END_OF_PROMPT not in instruct:
+        instruct = f"{instruct}{END_OF_PROMPT}"
+        log.info("appended %s to the instruction", END_OF_PROMPT)
     # The frontend re-reads the prompt three times (mel at 24k, speech token, and
     # speaker embedding at 16k), so it needs a seekable path — a BytesIO would be
     # empty after the first read.
@@ -216,12 +231,37 @@ def tts(
                 "tts seed=%d llm=%s flow=%s hift=%s prompt=%s speed=%s text=%r",
                 used_seed, llm, flow, hift, Path(source).name, speed, text[:60],
             )
-            chunks = [
-                out["tts_speech"]
-                for out in model.inference_instruct2(
-                    text, instruct, str(source), stream=False, speed=speed, text_frontend=text_frontend
-                )
-            ]
+            # CosyVoice3 runs the LLM in its own thread. When that thread raises, the
+            # token queue just ends up empty and the failure resurfaces here as a
+            # zero-width interpolate — which says nothing about the real cause. Map it
+            # back to something actionable and point at the container log for the
+            # original traceback.
+            try:
+                chunks = [
+                    out["tts_speech"]
+                    for out in model.inference_instruct2(
+                        text, instruct, str(source), stream=False, speed=speed, text_frontend=text_frontend
+                    )
+                ]
+            except torch.cuda.OutOfMemoryError as error:
+                # The card is shared with other services, so the usable headroom moves
+                # around. Report what is actually free instead of a bare traceback.
+                free, total = torch.cuda.mem_get_info()
+                torch.cuda.empty_cache()
+                raise HTTPException(
+                    503,
+                    f"GPU 記憶體不足（可用 {free / 2**20:.0f} MiB / 共 {total / 2**20:.0f} MiB）。"
+                    f"這張卡與其他服務共用，長文字需要較大的 KV cache。"
+                    f"請縮短文字，或停掉不需要的服務後重試。",
+                ) from error
+            except RuntimeError as error:
+                if "should be greater than 0" not in str(error):
+                    raise
+                raise HTTPException(
+                    500,
+                    "模型沒有產生任何語音 token，多半是 instruction 或輸入文字有問題。"
+                    "完整錯誤請看 `docker logs cosyvoice3-testbench`。",
+                ) from error
             if not chunks:
                 raise HTTPException(500, "model produced no audio")
             audio = torch.concat(chunks, dim=1)
