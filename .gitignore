@@ -37,6 +37,16 @@ raw_wav
 tensorboard
 **/*build*
 
+# The two rules above are broad on purpose (any `data` dir, anything named
+# *build*), but they also catch source that the test bench needs at runtime:
+# the Traditional→Simplified tables server.py loads on start-up, and the script
+# that regenerates them. They are 184 KB of JSON plus one file of Python, so
+# they belong in the repo — without them a fresh checkout starts with the
+# conversion silently disabled.
+!tools/build_token_safe_map.py
+!tools/data/
+!tools/data/*.json
+
 # Clangd files
 .cache
 compile_commands.json
