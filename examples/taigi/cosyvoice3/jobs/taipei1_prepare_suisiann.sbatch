@@ -28,7 +28,17 @@ set -euo pipefail
 : "${TP1_SUISIANN_AUDIO:?Set TP1_SUISIANN_AUDIO 指向 suisiann（連結的目標）}"
 
 tp1_cache="${TP1_CACHE:-${TP1_WORKSPACE}/cache}"
-mkdir -p "${TP1_WORKSPACE}/prepared" "${tp1_cache}"
+# prepared/ 刻意不預先建立：prepare_taigi_data.py 拒絕寫進已存在的目錄，先
+# mkdir 只會讓 job 拿到節點之後才失敗。
+mkdir -p "${TP1_WORKSPACE}" "${tp1_cache}"
+
+# 在登入節點就擋下來，不要等排到資源才發現。重跑請自行刪除，這樣不會有腳本
+# 在沒問過的情況下清掉幾小時的準備成果。
+if [[ -e "${TP1_WORKSPACE}/prepared" ]]; then
+  echo "已存在 ${TP1_WORKSPACE}/prepared —— 要重跑請先刪除：" >&2
+  echo "  rm -rf ${TP1_WORKSPACE}/prepared" >&2
+  exit 2
+fi
 
 # 音檔目錄要一起掛進去。suisiann_prepared 裡是相對符號連結，指到隔壁的
 # suisiann/，容器裡少掛一個，每一條連結都會斷。
