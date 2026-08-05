@@ -112,6 +112,9 @@ for split in ("train", "dev"):
             for key in counts:
                 if key in utt:
                     counts[key] += 1
-    print(f"{split}: 漢字 {counts['hanji']:,}  台羅 {counts['tailo']:,}", flush=True)
+    # 這裡不用單引號：整段被包在 bash -c '"'"'...'"'"' 裡，一個裸單引號就會提早
+    # 結束外層字串，counts[...] 的鍵會變成裸字然後 NameError。雙引號安全。
+    han, tai = counts["hanji"], counts["tailo"]
+    print(f"{split}: 漢字 {han:,}  台羅 {tai:,}", flush=True)
 PY
 '
