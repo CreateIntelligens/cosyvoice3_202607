@@ -24,17 +24,21 @@ tp1_mounts="${TP1_WORKSPACE}:/workspace"
 patch="${TP1_PATCH_DIR:-/mnt/shared/p06/cosyvoice/patches}/average_model.py"
 [[ -s "${patch}" ]] && tp1_mounts="${tp1_mounts},${patch}:/opt/CosyVoice/cosyvoice/bin/average_model.py:ro"
 
+# 「來源目錄:輸出前綴」，空白分隔。輸出名稱直接對應實驗代號，免得試聽時搞混。
+# 之前用 sed 從這份清單裡刪行來做單一實驗的匯出，結果把 for 迴圈的 `; do` 一起
+# 刪掉了——傳參數就不會有這種事。
+export TP1_EXPORT_PAIRS="${TP1_EXPORT_PAIRS:-\
+llm_ddp_v3a:llm_v3a \
+llm_ddp_v3b_lr2e5:llm_v3b_lr2e5 \
+llm_ddp_v3d_drama:llm_v3d_drama \
+llm_ddp_v3e_naer:llm_v3e_naer \
+llm_ddp_v3g_taskinstr:llm_v3g_taskinstr \
+flow_v3c:flow_v3c}"
+
 srun --container-image "${TP1_IMAGE}" --container-mounts "${tp1_mounts}" bash -c '
   set -euo pipefail
   cd /opt/CosyVoice
-  # 「來源目錄:輸出前綴」——輸出名稱直接對應實驗代號，免得試聽時搞混
-  for pair in \
-      llm_ddp_v3a:llm_v3a \
-      llm_ddp_v3b_lr2e5:llm_v3b_lr2e5 \
-      llm_ddp_v3d_drama:llm_v3d_drama \
-      llm_ddp_v3e_naer:llm_v3e_naer \
-      llm_ddp_v3g_taskinstr:llm_v3g_taskinstr \
-      flow_v3c:flow_v3c ; do
+  for pair in ${TP1_EXPORT_PAIRS}; do
     src=/workspace/exp/taigi_v1/${pair%%:*}
     name=${pair##*:}
     if [[ ! -d ${src} ]]; then echo "跳過 ${name}：${src} 不存在"; continue; fi
