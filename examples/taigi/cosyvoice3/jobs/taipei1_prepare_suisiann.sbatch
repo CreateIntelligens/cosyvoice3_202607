@@ -38,6 +38,15 @@ tp1_mounts+=",${tp1_cache}:/tmp/cosyvoice-cache"
 tp1_mounts+=",${TP1_SUISIANN}:/datasets/suisiann_prepared:ro"
 tp1_mounts+=",${TP1_SUISIANN_AUDIO}:/datasets/suisiann:ro"
 
+# 映像檔停在 7 月的版本，裡面的 prepare_taigi_data.py 還沒有 --transcript-jsonl，
+# 而這批資料的文字全靠它。單檔 bind mount 覆蓋掉容器內的版本，跟
+# taipei1_prepare_data.sbatch 用的是同一份 patch，兩邊不會分岔。
+tp1_patch_dir="${TP1_PATCH_DIR:-/mnt/shared/p06/cosyvoice/patches}"
+for patch in prepare_taigi_data.py validate_cosyvoice_data.py; do
+  [[ -s "${tp1_patch_dir}/${patch}" ]] &&
+    tp1_mounts+=",${tp1_patch_dir}/${patch}:/opt/CosyVoice/tools/${patch}:ro"
+done
+
 srun --container-image "${TP1_IMAGE}" --container-mounts "${tp1_mounts}" bash -c '
   set -euo pipefail
   cd /opt/CosyVoice

@@ -14,10 +14,18 @@ So each clip is emitted twice, once per spelling, pointing at the same audio:
     tailo/SuiSiann_0001.wav   Li2 kam2 bat4 khi3 seh8-kue3 Uniqlo1?
 
 The two live under separate speaker directories because prepare_taigi_data.py
-keys transcripts by resolved audio path, so one path can only carry one text.
-They are symlinks, and --materialize none references them in place, so the
-duplication costs no disk.  Both point at the same voice; the speaker embedding
-comes from the audio either way, so the split label is bookkeeping.
+keys transcripts by audio path, so one path can only carry one text.  Both point
+at the same voice; the speaker embedding comes from the audio either way, so the
+split label is bookkeeping.
+
+They are *hard* links.  Symlinks look like the obvious choice and silently
+destroy the experiment: that keying calls Path.resolve(), which follows symlinks,
+so hanji/x.wav and tailo/x.wav collapse to one key and whichever line comes
+second wins.  Both spellings then carry the same text and there is nothing left
+to compare — with no error anywhere, because the pipeline did exactly what it was
+asked.  Hard links are not followed by resolve(), so the two paths stay distinct
+while sharing an inode, and --materialize none means the duplication costs no
+disk either way.
 
 Tâi-lô is converted to numeric tones first.  Written with diacritics it does not
 survive Qwen's tokenizer — the eighth-tone mark has no precomposed form and
@@ -94,9 +102,15 @@ def main() -> int:
             link = out / variant / wav.name
             if link.is_symlink() or link.exists():
                 link.unlink()
-            # 相對連結，這棵樹才搬得動。絕對路徑在本機沒問題，但傳上叢集之後
-            # 每一條都會斷，而斷掉的連結在準備階段才會爆，那時已經排隊很久了。
-            link.symlink_to(Path("..") / ".." / wav.relative_to(out.parent))
+            # 硬連結而非符號連結——見檔頭。跨檔案系統時硬連結會失敗，那種情況
+            # 下複製才是對的：符號連結能建起來，但會把兩種寫法合併成一種。
+            try:
+                link.hardlink_to(wav)
+            except OSError as error:
+                raise SystemExit(
+                    f"無法建立硬連結（{error}）。{out} 與 {wav.parent} 若不在同一個"
+                    f"檔案系統，請把兩者放到同一個掛載點下，或改用複製。"
+                ) from error
             records.append({"audio": f"{variant}/{wav.name}", "text": texts[variant]})
         kept_seconds += duration
 
