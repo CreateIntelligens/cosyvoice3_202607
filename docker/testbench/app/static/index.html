@@ -42,6 +42,13 @@
   .tag.up { color: #9fdcb4; border-color: #4a7c59; }
   .tag.seed { cursor: pointer; color: var(--ok); border-color: #2d5548; }
   .tag.seed:hover { background: #2d5548; color: #eafff8; }
+  .tag.t2s { color: #c9a7ff; border-color: #4c3c6b; }
+  .tag.bad { color: #ffb3b3; border-color: #7c4a4a; }
+  .spoken { margin-top: 8px; font-size: 13px; }
+  .spoken summary { color: var(--muted); cursor: pointer; font-size: 12px; }
+  .spoken summary:hover { color: var(--ink); }
+  .spoken div { margin-top: 6px; padding: 8px 11px; border-radius: 7px;
+                background: #0e1016; border: 1px solid var(--line); }
   audio { width: 100%; margin-top: 8px; }
   .empty { color: var(--muted); text-align: center; padding: 48px 20px; }
   .err { color: #ff8f8f; }
@@ -69,6 +76,10 @@
   textarea.secondary { min-height: 52px; font-size: 12px; color: var(--muted); background: #0b0d12; }
   textarea.secondary:focus { color: var(--ink); }
   .hint.warn { color: #ffcf8f; }
+  .chk { display: flex; align-items: center; gap: 7px; margin: 9px 0 0; cursor: pointer; }
+  .chk input { width: auto; margin: 0; }
+  .chk span { font-size: 12px; color: var(--muted); letter-spacing: 0; }
+  .chk b { color: var(--accent); font-weight: 600; margin-left: 4px; }
 </style>
 </head>
 <body>
@@ -90,6 +101,13 @@
 
     <label>華語文字</label>
     <textarea id="text">明天早上九點，我們一起去市場買東西。</textarea>
+    <label>繁體字轉簡體字形</label>
+    <select id="simplify">
+      <option value="none">不轉換</option>
+      <option value="safe">只修會被拆成位元組的字</option>
+      <option value="full" selected>整句轉簡（預設）</option>
+    </select>
+    <div class="hint">Qwen 的詞彙表偏簡體，「廬」「傘」「佇」這類繁體字會退化成 UTF-8 位元組，模型從未把它們當成一個字。實測（official 模型合成華語）：不轉時「兇」「颱」「廬」都念錯；轉了就對。「乾杯」不轉會念成「前杯」，整句轉簡成「干杯」才正確——合併消除破音字的歧義，所以預設整句轉。</div>
 
     <label class="lblrow">
       <span>Instruction（訓練與推論必須一致，通常不用改）</span>
@@ -174,7 +192,9 @@ function fill(sel, items, preferred) {
   items.forEach(v => {
     const o = document.createElement("option");
     o.value = v;
-    o.textContent = v === "official" ? "official（原始模型）" : v;
+    // 檔名本身看不出那次訓練在測什麼，實驗一多就分不清楚
+    const note = v === "official" ? "原始模型" : (meta.notes || {})[v];
+    o.textContent = note ? `${v}（${note}）` : v;
     sel.appendChild(o);
   });
   if (preferred && items.includes(preferred)) sel.value = preferred;
@@ -187,11 +207,15 @@ async function init() {
       fetch("/api/health").then(r => r.json()),
     ]);
     meta = v;
-    fill($("llm"), v.parts.llm, "llm_best");
-    fill($("flow"), v.parts.flow, "flow_best");
+    // flow 預設 official：實測微調版與原始模型幾乎聽不出差別（見 v3-C）
+    fill($("llm"), v.parts.llm, "llm_v2_best");
+    fill($("flow"), v.parts.flow, "official");
     fill($("hift"), v.parts.hift, "official");
     $("instruct").value = v.default_instruct;
     DEFAULT_INSTRUCT = v.default_instruct;
+    const opt = $("simplify").options;
+    if (v.t2s_entries) opt[1].textContent += `（${v.t2s_entries} 字）`;
+    if (v.t2s_full_entries) opt[2].textContent += `（${v.t2s_full_entries} 字）`;
     checkInstruct();
 
     $("prompt_name").innerHTML = "";
@@ -240,6 +264,7 @@ $("go").onclick = async () => {
   fd.append("flow", $("flow").value);
   fd.append("hift", $("hift").value);
   fd.append("instruct", $("instruct").value);
+  fd.append("simplify", $("simplify").value);
   fd.append("speed", $("speed").value);
   fd.append("text_frontend", $("text_frontend").value);
   const rawSeed = $("seed").value.trim();
@@ -271,6 +296,9 @@ $("go").onclick = async () => {
       seed: res.headers.get("X-Seed"),
       prompt: file ? file.name : $("prompt_name").value,
       uploaded: !!file,
+      simplify: res.headers.get("X-Simplify") || "none;0",
+      spoken: decodeURIComponent(res.headers.get("X-Spoken-Text") || ""),
+      unfixable: decodeURIComponent(res.headers.get("X-Unfixable") || ""),
     });
     $("status").textContent = "";
   } catch (e) {
@@ -295,9 +323,27 @@ function addResult(r) {
       <span class="tag">長度 ${r.duration}s</span>
       <span class="tag">耗時 ${r.elapsed}s</span>
       <span class="tag seed" data-seed="${r.seed}" title="點一下沿用這個 seed">seed ${r.seed}</span>
+      ${simplifyTag(r)}
     </div>
-    <audio controls src="${r.url}"></audio>`;
+    <audio controls src="${r.url}"></audio>
+    ${spokenBlock(r)}`;
   $("results").prepend(el);
+}
+
+// 轉換過就標出來，並讓實際送進模型的文字可以展開查看——差異往往只有一兩個字，
+// 但那一兩個字正是念對念錯的關鍵。
+function simplifyTag(r) {
+  const [mode, n] = (r.simplify || "none;0").split(";");
+  if (mode === "none") return '<span class="tag">未轉換</span>';
+  const label = mode === "safe" ? "只修碎片字" : "整句轉簡";
+  return `<span class="tag t2s">${label} ${n} 字</span>`
+       + (r.unfixable ? `<span class="tag bad">仍是碎片 ${escapeHtml(r.unfixable)}</span>` : "");
+}
+
+function spokenBlock(r) {
+  if (!r.spoken || r.spoken === r.text) return "";
+  return `<details class="spoken"><summary>實際送進模型的文字</summary>`
+       + `<div>${escapeHtml(r.spoken)}</div></details>`;
 }
 
 function escapeHtml(s) {

@@ -63,6 +63,35 @@ PASSAGES: dict[str, tuple[str, str]] = {
         "他從彰化搭高鐵到左營，再轉台鐵到屏東潮州，拜訪住在那裡的林先生。",
         "地名人名——台語念法與華語差異大",
     ),
+
+    # 9–14 是為了比較 v2（naer 用台文）與 v4（naer 轉華語）而加的。兩種書寫系統
+    # 的差異幾乎都落在虛詞上——不/毋、在/佇、都/攏、要/欲、沒有/無——而實詞
+    # （垃圾、天氣、清除）兩邊寫法相同。所以差異該出現在虛詞密集的句子，
+    # 而不是以實詞為主的新聞稿。第 14 段是對照組，兩版應該一樣。
+    "9_function_neg": (
+        "我不知道他在哪裡，也沒有人告訴我，這件事情不能再拖下去了。",
+        "不、在、沒有——台文寫作毋、佇、無",
+    ),
+    "10_function_query": (
+        "你要不要跟我們一起去？什麼時候出發比較好？大家都還沒決定。",
+        "要、什麼、比較、都——台文寫作欲、啥物、較、攏",
+    ),
+    "11_function_deixis": (
+        "這個給你，那個放在桌子上面就好，其他的都不用拿過來。",
+        "這個、那個、都——台文寫作這个、彼个、攏",
+    ),
+    "12_naer_weather": (
+        "明天各地大多是晴朗的天氣，中午過後山區有短暫陣雨，出門記得帶傘。",
+        "天氣預報——naer 的主要內容，轉換後應最有感",
+    ),
+    "13_naer_announce": (
+        "請一百二十三號的旅客到三號櫃台辦理手續，謝謝您的配合。",
+        "服務廣播——naer 的另一大宗，含數字",
+    ),
+    "14_content_control": (
+        "台灣的高速公路系統連接北部和南部的主要城市，全長超過三百公里。",
+        "對照組：幾乎全是實詞，兩版寫法相同，預期沒有差異",
+    ),
 }
 
 DEFAULT_SEEDS = [1942676902, 20260803, 777]
@@ -71,10 +100,11 @@ DEFAULT_MODELS = ["llm_v2_best", "llm_v3a_best", "llm_v3e_naer_best"]
 
 def synthesise(api: str, out: Path, *, text: str, llm: str, flow: str, hift: str,
                prompt: str, prompt_wav: Path | None, seed: int, speed: float,
-               timeout: int) -> tuple[bool, str]:
+               timeout: int, simplify: str = "none") -> tuple[bool, str]:
     data = {
         "text": text, "llm": llm, "flow": flow, "hift": hift,
         "seed": str(seed), "speed": str(speed), "text_frontend": "false",
+        "simplify": simplify,
     }
     files = None
     if prompt_wav is not None:
@@ -107,6 +137,12 @@ def main() -> int:
     parser.add_argument("--prompt-wav", default="", help="改用自己的音檔（1–30 秒，建議 3–10 秒）")
     parser.add_argument("--seeds", nargs="+", type=int, default=DEFAULT_SEEDS)
     parser.add_argument("--texts", nargs="+", default=[], help="只跑這幾段（給編號，例如 2 4）")
+    # 繁體字在 Qwen 的詞彙表裡沒有共用字形就退化成 UTF-8 位元組，模型從未把它們
+    # 當成一個字。實測（official 模型、合成華語）：不轉時「兇」「颱」「廬」都念錯，
+    # 只修碎片字就全部念對；整句轉簡沒有更好，反而會動到「後」「麵」「乾」而念錯。
+    # 交給伺服器做，這裡只轉達模式，才不會和試聽台的行為分岔。
+    parser.add_argument("--simplify", choices=("none", "safe", "full"), default="none",
+                        help="繁體字轉簡體字形：safe 只修會碎片的，full 整句轉")
     parser.add_argument("--speed", type=float, default=1.0)
     parser.add_argument("--out", default="")
     parser.add_argument("--timeout", type=int, default=300)
@@ -143,6 +179,9 @@ def main() -> int:
         except ImportError:
             pass
 
+    if args.simplify != "none":
+        print(f"轉換模式：{args.simplify}（由伺服器套用，日誌會記錄實際換掉幾個字）")
+
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     root = Path(args.out) if args.out else Path("eval") / stamp
     root.mkdir(parents=True, exist_ok=True)
@@ -161,11 +200,13 @@ def main() -> int:
             folder.mkdir(exist_ok=True)
             for seed in args.seeds:
                 done += 1
-                name = f"{key}__{llm}__seed{seed}.wav"
+                tag = "" if args.simplify == "none" else f"_{args.simplify}"
+                name = f"{key}__{llm}{tag}__seed{seed}.wav"
                 ok, info = synthesise(
                     args.api, folder / name, text=text, llm=llm, flow=args.flow,
                     hift=args.hift, prompt=args.prompt, prompt_wav=prompt_wav,
                     seed=seed, speed=args.speed, timeout=args.timeout,
+                    simplify=args.simplify,
                 )
                 mark = "✓" if ok else "✗"
                 print(f"   [{done:>3}/{total}] {mark} {key} seed={seed}" + ("" if ok else f"  {info}"))
@@ -177,7 +218,7 @@ def main() -> int:
                     "prompt": prompt_wav.name if prompt_wav else args.prompt, "seed": seed,
                     "ok": ok, "note": "" if ok else info,
                     "file": str((folder / name).relative_to(root)) if ok else "",
-                    "text": text,
+                    "text": text, "simplify": args.simplify,
                 })
 
     manifest = root / "manifest.csv"
