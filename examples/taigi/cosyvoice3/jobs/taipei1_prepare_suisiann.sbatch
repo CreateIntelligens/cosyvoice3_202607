@@ -44,7 +44,10 @@ srun --container-image "${TP1_IMAGE}" --container-mounts "${tp1_mounts}" bash -c
 
   test -s /datasets/suisiann_prepared/metadata.jsonl
   # 連結解不開的話，後面每個階段都會失敗，而且錯誤訊息離原因很遠。
-  probe=$(find /datasets/suisiann_prepared/tailo -name "*.wav" | head -1)
+  #
+  # 用 -print -quit 而不是管到 head：head 讀夠就關管線，find 收到 SIGPIPE，
+  # 在 set -o pipefail 之下整個腳本就以 141 結束——而且什麼訊息都不會留下。
+  probe=$(find /datasets/suisiann_prepared/tailo -name "*.wav" -print -quit)
   test -r "${probe}" || { echo "符號連結斷了：${probe}" >&2; exit 2; }
   echo "連結可讀：${probe}"
 
