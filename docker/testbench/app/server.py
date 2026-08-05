@@ -76,6 +76,10 @@ MODEL_NOTES = {
     "llm_v3g_taskinstr_avg5": "v3-G · 分別標 instruction · 平均",
     "llm_v4_naerzh_best": "v4 · tai8+naer(文字轉華語) · 對照 v2",
     "llm_v4_naerzh_avg5": "v4 · naer 轉華語 · 平均",
+    # v5 是概念驗證，不是候選成品：4.62 小時單一語者，從 v2 續訓，要測的是
+    # 給它台羅數字調（khian5-khun1）會不會照著念。漢字那側預期退步。
+    "llm_v5_suisiann_best": "v5 · 媠聲 4.6h 教台羅標音 · 驗證用，非成品",
+    "llm_v5_suisiann_avg5": "v5 · 媠聲 · 平均 · 驗證用",
     # flow
     "flow_best": "v1 · 戲劇 190h",
     "flow_avg5": "v1 · 戲劇 190h · 平均",
