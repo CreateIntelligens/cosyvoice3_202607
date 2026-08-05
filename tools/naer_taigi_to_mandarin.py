@@ -244,6 +244,11 @@ def main() -> int:
         todo = list(suspects)
         for t in todo:
             done.pop(t, None)
+        # 先備份再改寫。重轉若因額度用盡而失敗，被挑出來的那些就永遠回不來了
+        # ——實際發生過一次，損失 2,841 句。
+        backup = out_path.with_suffix(out_path.suffix + ".bak")
+        backup.write_text(out_path.read_text(encoding="utf-8"), encoding="utf-8")
+        print(f"  已備份原檔到 {backup.name}")
         rewritten = [json.dumps({"taigi": t, "mandarin": m}, ensure_ascii=False)
                      for t, m in done.items()]
         out_path.write_text("\n".join(rewritten) + ("\n" if rewritten else ""), encoding="utf-8")
