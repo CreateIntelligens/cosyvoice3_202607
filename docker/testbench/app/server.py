@@ -60,8 +60,10 @@ MODEL_NOTES = {
     # llm
     "llm_best": "v1 · 戲劇 190h",
     "llm_avg5": "v1 · 戲劇 190h · 平均",
-    "llm_v2_best": "v2 · tai8+naer 324h · 目前基準",
-    "llm_v2_avg5": "v2 · tai8+naer 324h · 平均",
+    # 時數以 v2 workspace 的 prepared/summary.json 為準：train 255.30h，
+    # 連 dev/test 合計 284.47h。先前這裡寫 324h 是錯的。
+    "llm_v2_best": "v2 · tai8+naer 255h(train) · 目前基準",
+    "llm_v2_avg5": "v2 · tai8+naer 255h(train) · 平均",
     "llm_v3a_best": "v3-A · 重切戲劇+naer 598h",
     "llm_v3a_avg5": "v3-A · 598h · 平均",
     "llm_v3a_ep5": "v3-A · 598h · epoch 5 原始檔",

@@ -3,7 +3,18 @@
 # sbatch -p PARTITION -A ACCOUNT --export=ALL,TP1_IMAGE=...,TP1_WORKSPACE=...,TP1_MODELS=... \
 #   examples/taigi/cosyvoice3/jobs/taipei1_train_llm.sbatch
 #
-# One Slurm task owns the node. torchrun starts one worker for each of the 8 GPUs.
+# One Slurm task owns the node. torchrun starts one worker per allocated GPU.
+#
+# The directives below ask for the whole node, and sbatch --gres/--cpus-per-task
+# on the command line override them. Asking for all eight means waiting for the
+# node to empty completely; p06 has exactly one node shared with other accounts,
+# so a smaller request often finishes sooner in wall-clock terms even though the
+# training itself takes longer:
+#
+#   sbatch --gres=gpu:h100:4 --cpus-per-task=64 ... taipei1_train_llm.sbatch
+#
+# The worker count is read from the allocation rather than hard-coded, so the
+# override is the only thing that needs changing.
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:h100:8
@@ -27,6 +38,10 @@ mkdir -p \
 
 tp1_mounts="${TP1_WORKSPACE}:/workspace,${TP1_MODELS}:/models:ro,${tp1_cache}:/tmp/cosyvoice-cache"
 
+# SLURM_GPUS_ON_NODE 反映實際配到的張數，命令列用 --gres 覆寫時會跟著變。
+gpus="${TP1_GPUS:-${SLURM_GPUS_ON_NODE:-8}}"
+echo "配到 ${gpus} 張 GPU"
+
 srun --mpi=pmix \
   --container-image "${TP1_IMAGE}" \
   --container-mounts "${tp1_mounts}" \
@@ -39,8 +54,8 @@ srun --mpi=pmix \
     test -s /workspace/prepared/data/train/parquet/data.list
     test -s /workspace/prepared/data/dev/parquet/data.list
     test -w /workspace/exp
-    python -c "import torch; assert torch.cuda.is_available(); assert torch.cuda.device_count() == 8, torch.cuda.device_count(); print([torch.cuda.get_device_name(i) for i in range(8)])"
-    torchrun --standalone --nnodes=1 --nproc_per_node=8 \
+    python -c "import torch; assert torch.cuda.is_available(); assert torch.cuda.device_count() == '"${gpus}"', torch.cuda.device_count(); print([torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())])"
+    torchrun --standalone --nnodes=1 --nproc_per_node='"${gpus}"' \
       cosyvoice/bin/train.py \
       --train_engine torch_ddp \
       --model llm \
