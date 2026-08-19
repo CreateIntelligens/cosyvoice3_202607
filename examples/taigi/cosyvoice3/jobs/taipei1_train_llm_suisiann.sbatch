@@ -13,6 +13,8 @@
 # 結論仍然是成立的，後面用 TAT-TTS 的 40.6 小時混合既有語料重做就好。
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
+# 命令列的 --gres 會覆寫這一行；worker 數從配額讀，不寫死。先前寫死 2 而用
+# --gres=4 送出，job 拿到節點之後在斷言那行立刻失敗——白排一次隊。
 #SBATCH --gres=gpu:h100:2
 #SBATCH --cpus-per-task=32
 #SBATCH --time=06:00:00
@@ -42,6 +44,8 @@ tp1_mounts+=",${TP1_MODELS}:/models:ro"
 tp1_mounts+=",${tp1_cache}:/tmp/cosyvoice-cache"
 tp1_mounts+=",${TP1_INIT_CHECKPOINT}:/init/llm.pt:ro"
 
+gpus="${TP1_GPUS:-${SLURM_GPUS_ON_NODE:-2}}"
+echo "配到 ${gpus} 張 GPU"
 epochs="${TP1_MAX_EPOCH:-8}"
 warmup="${TP1_WARMUP:-200}"
 
@@ -71,9 +75,9 @@ for line in source.splitlines():
         print(line.strip(), flush=True)
 PY
 
-    python -c 'import torch; assert torch.cuda.device_count() == 2, torch.cuda.device_count()'
+    python -c 'import torch; assert torch.cuda.device_count() == ${gpus}, torch.cuda.device_count()'
 
-    torchrun --standalone --nnodes=1 --nproc_per_node=2 \
+    torchrun --standalone --nnodes=1 --nproc_per_node=${gpus} \
       cosyvoice/bin/train.py \
       --train_engine torch_ddp \
       --model llm \

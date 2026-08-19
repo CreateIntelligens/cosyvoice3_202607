@@ -19,6 +19,7 @@ import secrets
 import shutil
 import sys
 import threading
+from typing import NamedTuple
 from pathlib import Path
 from urllib.parse import quote
 
@@ -35,6 +36,9 @@ sys.path.insert(0, COSYVOICE_ROOT)
 sys.path.insert(0, f"{COSYVOICE_ROOT}/third_party/Matcha-TTS")
 
 from cosyvoice.cli.cosyvoice import AutoModel  # noqa: E402
+from cosyvoice.utils.frontend_utils import split_paragraph  # noqa: E402
+
+import public_api  # noqa: E402  對外 /v1 介面，見 public_api.py
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("testbench")
@@ -78,10 +82,19 @@ MODEL_NOTES = {
     "llm_v3g_taskinstr_avg5": "v3-G · 分別標 instruction · 平均",
     "llm_v4_naerzh_best": "v4 · tai8+naer(文字轉華語) · 對照 v2",
     "llm_v4_naerzh_avg5": "v4 · naer 轉華語 · 平均",
-    # v5 是概念驗證，不是候選成品：4.62 小時單一語者，從 v2 續訓，要測的是
-    # 給它台羅數字調（khian5-khun1）會不會照著念。漢字那側預期退步。
-    "llm_v5_suisiann_best": "v5 · 媠聲 4.6h 教台羅標音 · 驗證用，非成品",
-    "llm_v5_suisiann_avg5": "v5 · 媠聲 · 平均 · 驗證用",
+    # 這裡原本標「驗證用，非成品」，是訓練前寫下的預期——4.62 小時單一語者，
+    # 本來以為漢字那側會災難性遺忘。聽測結果相反：漢字沒退步，破音字反而變準，
+    # 判定比 v2 好一點。標籤已經不成立，改掉。
+    "llm_v5_suisiann_best": "v5 · v2+媠聲4.6h · 會讀台羅標音 · 判定優於 v2",
+    "llm_v5_suisiann_avg5": "v5 · v2+媠聲 · 平均",
+    # v6 與 v2 只差資料量、與 v4 只差 naer 用台文還是華語，三者互為單一變因對照。
+    # naer 全數 107,292 句都在，v4 因為文字轉換漏了 6,250 句。
+    "llm_v6_best": "v6 · 新 tai8+naer台文 291h(train) · 對照 v2(資料量)、v4(文字)",
+    "llm_v6_avg5": "v6 · 新 tai8+naer台文 · 平均",
+    "llm_v6_ep3": "v6 · epoch 3 原始檔（loss 最低，等同 best）",
+    # v7 = v6 + 媠聲，第二階段的設定與 v5 完全相同。兩者的 loss 曲線幾乎重疊
+    # （v5 ep3 2.647 / v7 ep3 2.644），代表這一步是可重現的，不是碰巧。
+    "llm_v7_best": "v7 · v6+媠聲4.6h · 資料與台羅標音都到位",
     # flow
     "flow_best": "v1 · 戲劇 190h",
     "flow_avg5": "v1 · 戲劇 190h · 平均",
@@ -96,6 +109,24 @@ MODEL_NOTES = {
 # torch accepts a much wider range, but 32-bit keeps the value short enough to
 # quote in a bug report and matches what the UI offers.
 MAX_SEED = 2 ** 31 - 1
+# 所有語料的 max-duration 都設 30 秒，模型從來沒見過更長的樣本。一段 200 字要講
+# 一分鐘，遠在訓練分布之外——LLM 的自迴歸生成到後面失去依據，產出的 speech token
+# 變成雜訊，而且會提早停：實測 211 字不切段只生出 41 秒，切段後 67 秒才是對的。
+#
+# CosyVoice 自己的 text_frontend 會切，但它同時做數字正規化、去括號、刪除漢字與
+# 拉丁字母之間的空格。那些對實驗對照是變數，對台羅標音也可能有影響，所以這裡只
+# 借它的切段函式，正規化不啟用。
+MAX_CHUNK_CHARS = int(os.environ.get("MAX_CHUNK_CHARS", "80"))
+
+
+def startup_model() -> tuple[str, str, str]:
+    """還沒有任何模型載入時要用哪一組。
+
+    render() 與 /v1 的回報端必須共用這一個答案。先前 render() 退回 official 而
+    回報端退回環境變數，結果 health 說跑的是 v5、實際合成用的是官方模型——
+    音檔和標頭對不起來，而且沒有任何錯誤。
+    """
+    return (public_api.LLM, public_api.FLOW, public_api.HIFT)
 # frontend.py asserts this before extracting speech tokens; catching it here turns
 # an opaque 500 into something the caller can act on.
 MAX_PROMPT_SEC = 30.0
@@ -190,7 +221,20 @@ def to_simplified(text: str, mode: str) -> tuple[str, int]:
     return out, sum(1 for a, b in zip(text, out) if a != b)
 
 
-app = FastAPI(title="CosyVoice3 checkpoint testbench")
+app = FastAPI(
+    title="CosyVoice3 台語 TTS",
+    version="1.0.0",
+    description=(
+        "兩組介面共用同一個模型與同一條合成路徑。\n\n"
+        "- **`/v1/*`** —— 給程式呼叫的穩定介面。只收文字與音色，模型由伺服器端決定。\n"
+        "- **`/api/*`** —— 試聽台自己用的，可以任意組合 checkpoint，隨實驗變動，不保證相容。\n\n"
+        "兩者走同一個 `render()`，所以聽到的和 agent 拿到的是同一個東西。"
+    ),
+    openapi_tags=[
+        {"name": "v1", "description": "對外 TTS 介面。需要 Bearer token。"},
+        {"name": "testbench", "description": "試聽台內部介面，會隨實驗變動。"},
+    ],
+)
 
 _lock = threading.Lock()
 _loaded: tuple[str, str, str] | None = None
@@ -283,6 +327,111 @@ def variants():
     }
 
 
+def split_for_synthesis(text: str, max_chars: int) -> list[str]:
+    """把長文切成模型吃得下的段落。短文原樣回傳，不動它。"""
+    if max_chars <= 0 or len(text) <= max_chars:
+        return [text]
+    pieces = [p for p in split_paragraph(
+        text, lambda t: t, "zh",
+        token_max_n=max_chars, token_min_n=max(20, max_chars * 3 // 4),
+        merge_len=20, comma_split=False) if p.strip()]
+    return pieces or [text]
+
+
+class Rendered(NamedTuple):
+    audio: torch.Tensor
+    sample_rate: int
+    seed: int
+    llm: str
+    flow: str
+    hift: str
+
+
+def render(
+    text: str,
+    *,
+    llm: str | None,
+    flow: str | None,
+    hift: str | None,
+    instruct: str,
+    source: Path,
+    speed: float,
+    text_frontend: bool,
+    seed: int,
+    note: str = "",
+    max_chunk_chars: int = 0,
+) -> Rendered:
+    """Synthesise one utterance.
+
+    Both the test bench and the public API come through here. They diverged once
+    before — batch_eval.py converted text locally while the server converted it
+    again — and the two produced different audio for what looked like the same
+    request. One path means that cannot happen.
+
+    Passing None for the three checkpoints means "whatever is already resident",
+    which is how /v1 follows the test bench. That choice has to be made inside the
+    lock: read it outside and a switch between the read and the synthesis would
+    have us report one model while using another.
+
+    Holds the GPU lock for the whole call: the three modules together need several
+    GB and this card is shared, so two concurrent syntheses would fight over VRAM
+    rather than overlap usefully.
+    """
+    with _lock:
+        if llm is None or flow is None or hift is None:
+            resident = _loaded or startup_model()
+            llm = llm if llm is not None else resident[0]
+            flow = flow if flow is not None else resident[1]
+            hift = hift if hift is not None else resident[2]
+        model = get_model(llm, flow, hift)
+        used_seed = apply_seed(seed)
+        # 種子只設一次，之後 RNG 自然往下走——與上游逐段合成的行為一致。
+        segments = split_for_synthesis(text, max_chunk_chars)
+        log.info(
+            "render seed=%d llm=%s flow=%s hift=%s prompt=%s speed=%s %s "
+            "段數=%d text=%r",
+            used_seed, llm, flow, hift, source.name, speed, note,
+            len(segments), text[:60],
+        )
+        # CosyVoice3 runs the LLM in its own thread. When that thread raises, the
+        # token queue just ends up empty and the failure resurfaces here as a
+        # zero-width interpolate — which says nothing about the real cause. Map it
+        # back to something actionable and point at the container log for the
+        # original traceback.
+        try:
+            chunks = [
+                out["tts_speech"]
+                for piece in segments
+                for out in model.inference_instruct2(
+                    piece, instruct, str(source), stream=False,
+                    speed=speed, text_frontend=text_frontend,
+                )
+            ]
+        except torch.cuda.OutOfMemoryError as error:
+            # The card is shared with other services, so the usable headroom moves
+            # around. Report what is actually free instead of a bare traceback.
+            free, total = torch.cuda.mem_get_info()
+            torch.cuda.empty_cache()
+            raise HTTPException(
+                503,
+                f"GPU 記憶體不足（可用 {free / 2**20:.0f} MiB / 共 {total / 2**20:.0f} MiB）。"
+                f"這張卡與其他服務共用，長文字需要較大的 KV cache。"
+                f"請縮短文字，或停掉不需要的服務後重試。",
+            ) from error
+        except RuntimeError as error:
+            if "should be greater than 0" not in str(error):
+                raise
+            raise HTTPException(
+                500,
+                "模型沒有產生任何語音 token，多半是 instruction 或輸入文字有問題。"
+                "完整錯誤請看 `docker logs cosyvoice3-testbench`。",
+            ) from error
+        if not chunks:
+            raise HTTPException(500, "model produced no audio")
+        return Rendered(torch.concat(chunks, dim=1), model.sample_rate,
+                        used_seed, llm, flow, hift)
+
+
 class Health(BaseModel):
     cuda: bool
     device: str | None
@@ -309,6 +458,9 @@ def tts(
     speed: float = Form(1.0),
     text_frontend: bool = Form(False),
     simplify: str = Form("none"),
+    # 長文自動分段。預設開啟——關掉的話 200 字以上就會生出一段講不完的音檔。
+    # 要逐字對照的實驗才關（設 0）。
+    max_chunk_chars: int = Form(MAX_CHUNK_CHARS),
     seed: int = Form(-1),
     prompt_wav: UploadFile | None = File(None),
 ):
@@ -366,51 +518,14 @@ def tts(
                     400, f"參考音檔只有 {duration:.2f} 秒，太短不足以描述音色，請用 3 秒以上。"
                 )
 
-        with _lock:
-            model = get_model(llm, flow, hift)
-            used_seed = apply_seed(seed)
-            log.info(
-                "tts seed=%d llm=%s flow=%s hift=%s prompt=%s speed=%s "
-                "simplify=%s(%d字)%s text=%r",
-                used_seed, llm, flow, hift, Path(source).name, speed,
-                simplify, swapped,
-                f" 仍是碎片[{unfixable}]" if unfixable else "", text[:60],
-            )
-            # CosyVoice3 runs the LLM in its own thread. When that thread raises, the
-            # token queue just ends up empty and the failure resurfaces here as a
-            # zero-width interpolate — which says nothing about the real cause. Map it
-            # back to something actionable and point at the container log for the
-            # original traceback.
-            try:
-                chunks = [
-                    out["tts_speech"]
-                    for out in model.inference_instruct2(
-                        text, instruct, str(source), stream=False, speed=speed, text_frontend=text_frontend
-                    )
-                ]
-            except torch.cuda.OutOfMemoryError as error:
-                # The card is shared with other services, so the usable headroom moves
-                # around. Report what is actually free instead of a bare traceback.
-                free, total = torch.cuda.mem_get_info()
-                torch.cuda.empty_cache()
-                raise HTTPException(
-                    503,
-                    f"GPU 記憶體不足（可用 {free / 2**20:.0f} MiB / 共 {total / 2**20:.0f} MiB）。"
-                    f"這張卡與其他服務共用，長文字需要較大的 KV cache。"
-                    f"請縮短文字，或停掉不需要的服務後重試。",
-                ) from error
-            except RuntimeError as error:
-                if "should be greater than 0" not in str(error):
-                    raise
-                raise HTTPException(
-                    500,
-                    "模型沒有產生任何語音 token，多半是 instruction 或輸入文字有問題。"
-                    "完整錯誤請看 `docker logs cosyvoice3-testbench`。",
-                ) from error
-            if not chunks:
-                raise HTTPException(500, "model produced no audio")
-            audio = torch.concat(chunks, dim=1)
-            sample_rate = model.sample_rate
+        out = render(
+            text, llm=llm, flow=flow, hift=hift, instruct=instruct, source=Path(source),
+            speed=speed, text_frontend=text_frontend, seed=seed,
+            max_chunk_chars=0 if text_frontend else max_chunk_chars,
+            note=f"simplify={simplify}({swapped}字)"
+                 + (f" 仍是碎片[{unfixable}]" if unfixable else ""),
+        )
+        audio, sample_rate, used_seed = out.audio, out.sample_rate, out.seed
     finally:
         if tmp_prompt is not None:
             tmp_prompt.unlink(missing_ok=True)
@@ -450,6 +565,30 @@ def prompt_audio(name: str):
     return FileResponse(path, media_type="audio/wav")
 
 
+def _variant_path(part: str, name: str) -> Path | None:
+    """part_path 但不會丟例外——算 model_version 時不該因為檔案不在就 500。"""
+    try:
+        return part_path(part, name)
+    except HTTPException:
+        return None
+
+
+def _current_model() -> tuple[str, str, str]:
+    """/v1 跟著試聽台：回報常駐的那一組，還沒載入就回起始值。"""
+    return _loaded or startup_model()
+
+
+app.include_router(public_api.create_router(
+    render=render,
+    current_model=_current_model,
+    prompts_dir=PROMPTS_DIR,
+    variant_path=_variant_path,
+    to_simplified=to_simplified,
+    instruct=DEFAULT_INSTRUCT,
+))
+app.add_exception_handler(public_api.ApiError, public_api.api_error_handler)
+
+# 這一行要放在所有路由之後：掛在 "/" 的 StaticFiles 會接住剩下的一切。
 app.mount("/", StaticFiles(directory=STATIC_DIR, html=True), name="static")
 
 

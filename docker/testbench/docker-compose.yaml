@@ -21,6 +21,14 @@ services:
       # allocations as small as 12 MiB. Expandable segments let the allocator grow a
       # region instead of hunting for a contiguous free block.
       PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+      # /v1 是給 agent 呼叫的介面。沒有這把 token 它一律回 503——寧可停用，
+      # 也不要因為忘了設定就變成開放端點。放進 .env，不要寫進這個檔。
+      TTS_API_KEY: ${TTS_API_KEY:-}
+      # 掛哪組 checkpoint 是伺服器的決定，呼叫端不指定。換版本改這裡重啟即可，
+      # model_version 會跟著變，呼叫端的快取自動失效。
+      TTS_API_LLM: ${TTS_API_LLM:-llm_v5_suisiann_best}
+      TTS_API_FLOW: ${TTS_API_FLOW:-official}
+      TTS_API_HIFT: ${TTS_API_HIFT:-official}
     # This host already runs 55 containers across 33 bridge networks and Docker's
     # default address pools are exhausted, so creating another one fails. Host
     # networking sidesteps it; the server binds 0.0.0.0:50010 itself.
