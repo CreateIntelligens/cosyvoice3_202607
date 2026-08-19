@@ -150,6 +150,9 @@ MAX_WAIT_SEC = float(os.environ.get("TTS_API_MAX_WAIT_SEC", "600"))
 MAX_TEXT_CHARS = int(os.environ.get("TTS_API_MAX_TEXT_CHARS", "5000"))
 # 每段的字數上限，交給 render() 切。
 CHUNK_CHARS = int(os.environ.get("TTS_API_CHUNK_CHARS", "80"))
+# 逗號要不要當切點，用 server 的環境變數（COMMA_SPLIT），不做成請求參數：
+# 呼叫端不該需要知道這件事，而同一批內容用不同切法會前後不一致。
+# 要換就換伺服器設定，整批一起換。
 
 
 # ---------------------------------------------------------------- schema

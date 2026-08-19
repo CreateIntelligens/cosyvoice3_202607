@@ -95,6 +95,26 @@ MODEL_NOTES = {
     # v7 = v6 + 媠聲，第二階段的設定與 v5 完全相同。兩者的 loss 曲線幾乎重疊
     # （v5 ep3 2.647 / v7 ep3 2.644），代表這一步是可重現的，不是碰巧。
     "llm_v7_best": "v7 · v6+媠聲4.6h · 資料與台羅標音都到位",
+    # v8/v9 把第二階段的台羅資料放大。v5/v7 的 4.62 小時在 epoch 3 就見底然後
+    # 過擬合；這兩個到 epoch 7 都還在降，資料量一放大過擬合就消失了。
+    # 兩者的 dev set 不同（v8 是教育部朗讀、v9 是 384 位語者的 naer），
+    # loss 不能互相比較，只能各看各的走勢。
+    "llm_v8a_moe_restricted": "v8a · v6+媠聲+教育部33h · ⚠授權受限，不得公開發布",
+    "llm_v8b_moe_restricted": "v8b · 同 v8a 但 20 epoch · ⚠授權受限",
+    "llm_v9_naertailo": "v9 · v6+媠聲+naer台羅197h · 授權乾淨",
+    "llm_v9b_naertailo": "v9b · 同 v9 但 20 epoch · 授權乾淨",
+    # 第二階段訓愈重，長文能力愈差——而 CV loss 完全看不出來。實測 155 字的
+    # 氣象稿（人工聽寫比對）：v7 三個 seed 全部完整、v8a 1/3、v9 0/3，缺 16–60 字。
+    # v9b 的 loss 從 2.46 降到 1.35、acc 升到 0.68，指標上最好，長文預期最差。
+    #
+    # 原因不是「第二階段的句子太短」——naer 中位 6.11 秒，一點都不短。比較站得住
+    # 的解釋是量：長文（48 秒）從來不在任何訓練資料裡（全部上限 30 秒），能講完
+    # 靠的是 v6 底模的外插。第二階段 214,510 筆跑 8 epoch，把那個能力洗掉了；
+    # v7 只有 6,422 筆，幾乎沒動到底模。
+    "llm_v8_ep3": "v8 · epoch 3（對齊 v7 的收斂點）· ⚠授權受限",
+    "llm_v9_ep3": "v9 · epoch 3（對齊 v7 的收斂點）· 授權乾淨",
+    "llm_v8b_ep19": "v8b · epoch 19 · loss 1.80 · ⚠授權受限",
+    "llm_v9b_ep19": "v9b · epoch 19 · loss 1.35 最低 · 長文預期最差",
     # flow
     "flow_best": "v1 · 戲劇 190h",
     "flow_avg5": "v1 · 戲劇 190h · 平均",
@@ -116,7 +136,25 @@ MAX_SEED = 2 ** 31 - 1
 # CosyVoice 自己的 text_frontend 會切，但它同時做數字正規化、去括號、刪除漢字與
 # 拉丁字母之間的空格。那些對實驗對照是變數，對台羅標音也可能有影響，所以這裡只
 # 借它的切段函式，正規化不啟用。
+# 一段最多幾個字。實測字/秒：60 字 3.09、80 字 3.18、110 字 3.89（尾巴已經在掉）。
 MAX_CHUNK_CHARS = int(os.environ.get("MAX_CHUNK_CHARS", "80"))
+
+# 逗號要不要也當切點。預設關閉，因為在逗號切會把句子從中間剖開：前半被當成句尾
+# 唸完收尾，後半又從頭起一句，語意還在延續而語調已經結束又重來——聽起來就是
+# 接不上。在句號切就沒有這個問題。
+#
+# 代價是整段只有逗號的文字（新聞稿很常見）切不開，超過上限就會講不完、尾巴整句
+# 消失。兩種失敗各有各的難聽，所以做成開關讓人選，而不是替人決定。
+COMMA_SPLIT = os.environ.get("COMMA_SPLIT", "0") not in ("0", "", "false", "False")
+
+# frontend.py asserts this before extracting speech tokens; catching it here turns
+# an opaque 500 into something the caller can act on.
+MAX_PROMPT_SEC = 30.0
+MIN_PROMPT_SEC = 1.0
+# CosyVoice3 tokenises this to id 151646 and asserts on its presence; without it the
+# LLM thread dies before emitting a single token.
+END_OF_PROMPT = "<|endofprompt|>"
+DEFAULT_INSTRUCT = f"You are a helpful assistant. 請將輸入的華語翻譯成自然的臺灣台語並朗讀。{END_OF_PROMPT}"
 
 
 def startup_model() -> tuple[str, str, str]:
@@ -127,14 +165,6 @@ def startup_model() -> tuple[str, str, str]:
     音檔和標頭對不起來，而且沒有任何錯誤。
     """
     return (public_api.LLM, public_api.FLOW, public_api.HIFT)
-# frontend.py asserts this before extracting speech tokens; catching it here turns
-# an opaque 500 into something the caller can act on.
-MAX_PROMPT_SEC = 30.0
-MIN_PROMPT_SEC = 1.0
-# CosyVoice3 tokenises this to id 151646 and asserts on its presence; without it the
-# LLM thread dies before emitting a single token.
-END_OF_PROMPT = "<|endofprompt|>"
-DEFAULT_INSTRUCT = f"You are a helpful assistant. 請將輸入的華語翻譯成自然的臺灣台語並朗讀。{END_OF_PROMPT}"
 
 # Qwen 的詞彙表偏簡體：繁體字沒有共用字形就退化成 UTF-8 位元組，訓練文字裡
 # 20.6% 的相異字都這樣（嬤、諒、蹤、廬…），模型從未把它們當成一個字看待。
@@ -327,14 +357,35 @@ def variants():
     }
 
 
-def split_for_synthesis(text: str, max_chars: int) -> list[str]:
-    """把長文切成模型吃得下的段落。短文原樣回傳，不動它。"""
+def split_for_synthesis(text: str, max_chars: int, comma_split: bool) -> list[str]:
+    """把長文切成模型吃得下的段落。短文原樣回傳，不動它。
+
+    先在句末標點切，那是最自然的停頓。但一段話可能整段只有逗號、句號只在最後
+    一個字——新聞稿常常這樣寫——那樣切完仍然是一整段。實測 155 字的氣象稿就是
+    這種情形：切成「1/1 段」，模型講到一半停掉，聽起來就是後面某段整個消失。
+    所以仍然過長的段落再用逗號切一次。
+    """
     if max_chars <= 0 or len(text) <= max_chars:
         return [text]
-    pieces = [p for p in split_paragraph(
-        text, lambda t: t, "zh",
-        token_max_n=max_chars, token_min_n=max(20, max_chars * 3 // 4),
-        merge_len=20, comma_split=False) if p.strip()]
+
+    def by_punctuation(chunk: str, commas: bool) -> list[str]:  # noqa: D401
+        return [p for p in split_paragraph(
+            chunk, lambda t: t, "zh",
+            token_max_n=max_chars, token_min_n=max(20, max_chars * 3 // 4),
+            merge_len=20, comma_split=commas) if p.strip()]
+
+    pieces: list[str] = []
+    for piece in by_punctuation(text, False) or [text]:
+        if len(piece) <= max_chars or not comma_split:
+            # 關閉逗號切時，過長的段落原樣送出——模型可能講不完，但至少不會
+            # 在句子中間斷開。日誌會把「太短」標出來，聽的人知道發生了什麼。
+            pieces.append(piece)
+            continue
+        finer = by_punctuation(piece, True)
+        # 連逗號都沒有就只能硬切。寧可在詞中間斷，也不要整段講不完。
+        if not finer or max(len(p) for p in finer) > max_chars:
+            finer = [piece[i:i + max_chars] for i in range(0, len(piece), max_chars)]
+        pieces.extend(finer)
     return pieces or [text]
 
 
@@ -360,6 +411,7 @@ def render(
     seed: int,
     note: str = "",
     max_chunk_chars: int = 0,
+    comma_split: bool = COMMA_SPLIT,
 ) -> Rendered:
     """Synthesise one utterance.
 
@@ -386,7 +438,7 @@ def render(
         model = get_model(llm, flow, hift)
         used_seed = apply_seed(seed)
         # 種子只設一次，之後 RNG 自然往下走——與上游逐段合成的行為一致。
-        segments = split_for_synthesis(text, max_chunk_chars)
+        segments = split_for_synthesis(text, max_chunk_chars, comma_split)
         log.info(
             "render seed=%d llm=%s flow=%s hift=%s prompt=%s speed=%s %s "
             "段數=%d text=%r",
@@ -399,14 +451,41 @@ def render(
         # back to something actionable and point at the container log for the
         # original traceback.
         try:
-            chunks = [
-                out["tts_speech"]
-                for piece in segments
-                for out in model.inference_instruct2(
+            # 逐段收，而不是一個列表推導：一段沒產出時要看得見。先前寫成推導，
+            # 失敗的段落只是不貢獻元素——音檔少了一截、總長變短，而日誌上什麼
+            # 都沒有。使用者聽到「中間某段沒聲音」「最後一段直接不見」就是這個。
+            chunks = []
+            empty: list[int] = []
+            for index, piece in enumerate(segments, 1):
+                got = [out["tts_speech"] for out in model.inference_instruct2(
                     piece, instruct, str(source), stream=False,
                     speed=speed, text_frontend=text_frontend,
-                )
-            ]
+                )]
+                produced = sum(c.shape[1] for c in got)
+                seconds = produced / model.sample_rate
+                # 每段都記時長。空段落固然要抓，但「有聲音卻明顯太短」同樣是
+                # 失敗——那是模型講到一半停掉，聽起來就是某一段消失了。
+                # 實測這個模型約每秒 3.5–4.5 字。門檻先前設每秒 8 字太寬鬆——
+                # 155 字只生出 27.8 秒（每秒 5.6 字）明顯是講不完，卻沒被抓到。
+                expected = len(piece) / 5.5
+                if not got or produced == 0:
+                    empty.append(index)
+                    log.warning("第 %d/%d 段沒有產出任何語音：%r",
+                                index, len(segments), piece[:40])
+                elif seconds < expected:
+                    empty.append(index)
+                    log.warning("第 %d/%d 段只有 %.1f 秒但有 %d 字（至少該有 %.1f 秒），"
+                                "多半是講到一半停掉：%r",
+                                index, len(segments), seconds, len(piece),
+                                expected, piece[:40])
+                else:
+                    log.info("  第 %d/%d 段 %.1f 秒 / %d 字",
+                             index, len(segments), seconds, len(piece))
+                chunks.extend(got)
+            if empty:
+                log.warning("共 %d/%d 段沒有聲音（第 %s 段），輸出會比預期短",
+                            len(empty), len(segments),
+                            "、".join(str(i) for i in empty))
         except torch.cuda.OutOfMemoryError as error:
             # The card is shared with other services, so the usable headroom moves
             # around. Report what is actually free instead of a bare traceback.
@@ -461,6 +540,8 @@ def tts(
     # 長文自動分段。預設開啟——關掉的話 200 字以上就會生出一段講不完的音檔。
     # 要逐字對照的實驗才關（設 0）。
     max_chunk_chars: int = Form(MAX_CHUNK_CHARS),
+    # 逗號切預設照環境變數，但試聽台可以逐次覆寫，方便直接 A/B 兩種切法。
+    comma_split: bool = Form(COMMA_SPLIT),
     seed: int = Form(-1),
     prompt_wav: UploadFile | None = File(None),
 ):
@@ -522,6 +603,7 @@ def tts(
             text, llm=llm, flow=flow, hift=hift, instruct=instruct, source=Path(source),
             speed=speed, text_frontend=text_frontend, seed=seed,
             max_chunk_chars=0 if text_frontend else max_chunk_chars,
+            comma_split=comma_split,
             note=f"simplify={simplify}({swapped}字)"
                  + (f" 仍是碎片[{unfixable}]" if unfixable else ""),
         )
