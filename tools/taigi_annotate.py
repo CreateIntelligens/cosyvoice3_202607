@@ -136,9 +136,67 @@ def segment(text: str, lex: dict[str, list[str]]):
     return out
 
 
+CLAUSE = re.compile(r"[^，。！？；：、\n]+|[，。！？；：、\n]+")
+
+
+def most_frequent(word: str, readings: list[str]) -> str:
+    """辭典裡出現最多次的讀音。**這個挑法會錯得很兇。**
+
+        把 → lak8（該是 ka7）      冰箱 → ping1-kui7 冰櫃（該是 ping1-siunn1）
+        東西 → mih8（該是 mih8-kiann7）  準備 → tshuan5（該是 tsun2-pi7）
+
+    出現次數跟「這一句該用哪個」沒有關係。真的要選對得看上下文，那是
+    taigi_disambiguate.py 的工作——把它的 resolver 當 pick 傳進來。
+
+    留這個當預設是因為要有東西可退，但它產出的是**流利的錯話**：模型會穩定地
+    念出來，聽起來很順，講的卻不是那個意思。比幻覺更難察覺。
+    """
+    return readings[0]
+
+
+def annotate_clause_wise(text: str, *, only_unambiguous: bool = False, pick=most_frequent):
+    """整句標，或整句不標——不產生漢字與台羅混在一起的句子。
+
+    量過 10 個 seed：混排 1/10 會幻覺（3.5 秒的句子生出 21.6 秒），純漢字與
+    全台羅都是 0/10。漢字夾在台羅中間是唯一會出事的形態，所以寧可整句不標。
+
+    一個子句裡只要有一個詞查不到讀音，整句原樣保留。這讓覆蓋率變低，但低覆蓋率
+    是安全的失敗——不標就是現在 v7 的行為，而混排會生出幻覺。
+
+    pick  怎麼從多個讀音裡挑一個。預設按辭典出現次數，而那**選得很差**，
+          見 most_frequent。要挑對就傳 taigi_disambiguate 的 resolver 進來。
+    """
+    lex = lexicon()
+    out, changed = [], []
+    for clause in CLAUSE.findall(text):
+        if not clause.strip() or CLAUSE.match(clause) and not re.search(r"\w", clause):
+            out.append(clause)
+            continue
+        words = segment(clause, lex)
+        # 整句要換就每個詞都得有讀音，包括模型本來念得對的那些
+        resolved = []
+        for word, readings in words:
+            if not word.strip():
+                continue
+            if readings is None or (only_unambiguous and len(readings) > 1):
+                resolved = None
+                break
+            resolved.append((word, pick(word, readings)))
+        if resolved is None:
+            out.append(clause)
+            continue
+        out.append(" ".join(k for _, k in resolved))
+        changed.extend((w, k, len(lex[w])) for w, k in resolved)
+    text = re.sub(r" +([，。！？；：、])", r"\1", "".join(out))
+    return text.strip(), changed
+
+
 def annotate(text: str, *, only_unambiguous: bool = True,
              wordlist: set[str] | None = None, skip_taigi_words: bool = True):
-    """回傳（標好的文字, 改了哪些詞）。
+    """逐詞標音。回傳（標好的文字, 改了哪些詞）。
+
+    **會產生混排，而混排 1/10 會幻覺。** 一般用途請用 annotate_clause_wise。
+    這支留著是因為指定 wordlist 手工標單一個詞時仍然有用（研究、對照實驗）。
 
     標音一律「換掉原字」。試過並列的寫法——「乾坤(khian5-khun1)」模型會念兩遍，
     先念漢字再念羅馬字，等於沒覆寫到還多講一次。要覆寫就得把字換掉。
@@ -183,15 +241,27 @@ def main() -> int:
     ap.add_argument("--annotate-native", action="store_true",
                     help="連台語本來就有的詞也標。預設不標，那些模型自己念得對")
     ap.add_argument("--show", action="store_true", help="列出改了哪些詞")
+    ap.add_argument("--strict", action="store_true",
+                    help="整句模式下，子句裡有多義詞就整句不標。預設取最常見的讀音")
+    ap.add_argument("--per-word", action="store_true",
+                    help="逐詞標，會產生混排。混排 1/10 會幻覺，只在做對照實驗時用")
     a = ap.parse_args()
 
     text = a.text if a.text else sys.stdin.read().strip()
-    out, changed = annotate(
-        text,
-        only_unambiguous=not a.all,
-        wordlist=set(a.words.split(",")) if a.words else None,
-        skip_taigi_words=not a.annotate_native,
-    )
+    if a.per_word or a.words:
+        out, changed = annotate(
+            text,
+            only_unambiguous=not a.all,
+            wordlist=set(a.words.split(",")) if a.words else None,
+            skip_taigi_words=not a.annotate_native,
+        )
+    else:
+        out, changed = annotate_clause_wise(text, only_unambiguous=a.strict)
+        ambiguous = sum(1 for _, _, n in changed if n > 1)
+        if ambiguous:
+            print(f"  警告：{ambiguous} 個詞是按辭典出現次數挑的，那個挑法會錯"
+                  f"（把→lak8、冰箱→ping1-kui7）。要挑對請用 taigi_disambiguate.py",
+                  file=sys.stderr)
     print(out)
     if a.show:
         for w, k, n in changed:
