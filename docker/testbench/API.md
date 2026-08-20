@@ -59,7 +59,7 @@ TTS_API_AUTH: "off"     # 在 docker-compose.yaml 的 environment
 
 ```json
 {
-  "model_version": "taigi-2026.08-1cf89d92",
+  "model_version": "taigi-2026.08-c0b2231f",
   "voices": [
     {
       "voice_id": "taigi-male-01",
@@ -124,8 +124,8 @@ curl http://10.9.0.35:50010/v1/health
 ```json
 {
   "status": "ok",
-  "model_version": "taigi-2026.08-1cf89d92",
-  "model": {"llm": "llm_v5_suisiann_best", "flow": "official",
+  "model_version": "taigi-2026.08-c0b2231f",
+  "model": {"llm": "llm_v7_best", "flow": "official",
             "hift": "official", "simplify": "full"},
   "cuda": true,
   "detail": null
@@ -172,6 +172,16 @@ checkpoint。合成的回應也帶 `X-Model-Llm`，所以拿到一個音檔之�
 所以超過一句就自動分段（用 CosyVoice 的 `split_paragraph`，按標點切、每段約 80
 字），逐段合成再串接。538 字切成 7 段、音長 127 秒、耗時 139 秒。
 
+**預設只在句末標點切**（`。？！；：`），逗號不切。整段只用逗號串連的文字——新聞稿
+常這樣寫——會維持單段送進模型，超過 80 字就可能講不完。
+
+`COMMA_SPLIT=1` 可以改成在逗號也切，但**預設關閉**，因為兩種失敗都難聽而後者更難
+察覺：在逗號切會把一句話從中間剖開，前半被當成句尾唸完收尾、後半又從頭起一句，
+語意還在延續而語調已經結束又重來，接縫處聽得出明顯的跳。**漏字聽得出來，跳掉的
+語調聽起來像是模型本來就這樣講**，所以留給人決定，不預設打開。
+
+呼叫端最可靠的做法是自己先斷句：在語意完整的地方放句號，分段點就是你決定的。
+
 分段只借切段函式，**不啟用 CosyVoice 的其他正規化**——那會做數字轉寫、去括號、
 刪除漢字與拉丁字母之間的空格，對台羅標音有影響，也讓實驗對照多出變數。
 
@@ -182,12 +192,13 @@ checkpoint。合成的回應也帶 `X-Model-Llm`，所以拿到一個音檔之�
 | 環境變數 | 預設 | 說明 |
 |---|---|---|
 | `TTS_API_KEY` | 無 | **必設**，否則 `/v1` 停用 |
-| `TTS_API_LLM` | `llm_v5_suisiann_best` | 掛哪個 LLM checkpoint |
+| `TTS_API_LLM` | `llm_v7_best` | 掛哪個 LLM checkpoint |
 | `TTS_API_FLOW` / `TTS_API_HIFT` | `official` | 這兩個微調過沒有比較好 |
 | `TTS_API_SIMPLIFY` | `full` | 繁→簡字形轉換，只換字形不換用詞 |
 | `TTS_API_MAX_WAIT_SEC` | `600` | 排隊超過就回 429。呼叫端的 timeout 要比它大 |
 | `TTS_API_MAX_TEXT_CHARS` | `5000` | 文字上限 |
 | `TTS_API_CHUNK_CHARS` | `80` | 每段字數，長文照這個切 |
+| `COMMA_SPLIT` | `0` | 是否在逗號也切段（見上）。試聽台與 `/v1` 共用這個設定 |
 
 換模型改環境變數重啟即可，`model_version` 會跟著變。
 
