@@ -26,7 +26,11 @@ services:
       TTS_API_KEY: ${TTS_API_KEY:-}
       # 掛哪組 checkpoint 是伺服器的決定，呼叫端不指定。換版本改這裡重啟即可，
       # model_version 會跟著變，呼叫端的快取自動失效。
-      TTS_API_LLM: ${TTS_API_LLM:-llm_v5_suisiann_best}
+      # v7 = v6 底 + 媠聲 4.62 h。聽完 v5 到 v9b 全部版本之後的選擇——不是照
+      # CV loss 選的，v7 的 loss（2.644）在候選裡最差，而放大第二階段的 v9b
+      # loss 最低（1.352）卻連 155 字都講不完。詳見
+      # reports/taigi-tailo-scaling-2026-08-20.md
+      TTS_API_LLM: ${TTS_API_LLM:-llm_v7_best}
       TTS_API_FLOW: ${TTS_API_FLOW:-official}
       TTS_API_HIFT: ${TTS_API_HIFT:-official}
     # This host already runs 55 containers across 33 bridge networks and Docker's
