@@ -116,14 +116,16 @@ def segment(text: str, lex: dict[str, list[str]]):
 
 
 def annotate(text: str, *, only_unambiguous: bool = True,
-             wordlist: set[str] | None = None, mark: str = "replace"):
+             wordlist: set[str] | None = None):
     """回傳（標好的文字, 改了哪些詞）。
+
+    標音一律「換掉原字」。試過並列的寫法——「乾坤(khian5-khun1)」模型會念兩遍，
+    先念漢字再念羅馬字，等於沒覆寫到還多講一次。要覆寫就得把字換掉。
 
     only_unambiguous  辭典給出多種讀音時不標。挑錯讀音比不標更糟——
                       不標至少還有模型自己的判斷，標錯是直接指定念錯。
+                      多義詞要標的話交給 taigi_disambiguate.py
     wordlist          只標這些詞。給 None 表示標所有查得到的
-    mark              replace = 原字換成台羅（訓練時見過的形式）
-                      append  = 原字保留，台羅放在括號裡
     """
     lex = lexicon()
     pieces, changed = [], []
@@ -138,10 +140,11 @@ def annotate(text: str, *, only_unambiguous: bool = True,
             pieces.append(word)
             continue
         kip = readings[0]
-        pieces.append(f" {kip} " if mark == "replace" else f"{word}({kip})")
+        pieces.append(f" {kip} ")
         changed.append((word, kip, len(readings)))
     # 換字會在中文之間留下多餘空白，收乾淨
-    return re.sub(r"\s+([，。！？；：、])", r"\1", "".join(pieces)).strip(), changed
+    text = re.sub(r" {2,}", " ", "".join(pieces))
+    return re.sub(r"\s+([，。！？；：、])", r"\1", text).strip(), changed
 
 
 def main() -> int:
@@ -151,7 +154,6 @@ def main() -> int:
     ap.add_argument("--all", action="store_true",
                     help="多義詞也標（取最常見的讀音）。預設只標唯一讀音的詞")
     ap.add_argument("--words", help="只標這些詞，逗號分隔")
-    ap.add_argument("--append", action="store_true", help="保留原字，台羅放括號裡")
     ap.add_argument("--show", action="store_true", help="列出改了哪些詞")
     a = ap.parse_args()
 
@@ -160,7 +162,6 @@ def main() -> int:
         text,
         only_unambiguous=not a.all,
         wordlist=set(a.words.split(",")) if a.words else None,
-        mark="append" if a.append else "replace",
     )
     print(out)
     if a.show:
