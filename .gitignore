@@ -83,3 +83,4 @@ docker/testbench/eval/
 # /v1 的 Bearer token；每個部署各自不同，不進版控。
 docker/testbench/.env
 workspace/chhoetaigi/lexicon.json
+workspace/moe_sutian/taigi_words.json

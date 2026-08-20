@@ -32,6 +32,7 @@ ROOT = Path(__file__).resolve().parent.parent
 CHHOETAIGI = ROOT / "workspace/chhoetaigi/ChhoeTaigi_TaihoaSoanntengTuichiautian.csv"
 KAUTIAN = ROOT / "workspace/moe_sutian/kautian.ods"
 CACHE = ROOT / "workspace/chhoetaigi/lexicon.json"
+TAIGI_WORDS = ROOT / "workspace/moe_sutian/taigi_words.json"
 
 # 台羅音節結尾是 p/t/k/h 的是入聲，沒標數字就是第 4 調；其餘沒標就是第 1 調。
 STOPS = ("p", "t", "k", "h")
@@ -95,6 +96,26 @@ def lexicon() -> dict[str, list[str]]:
     return lex
 
 
+@lru_cache(maxsize=1)
+def taigi_words() -> frozenset[str]:
+    """教育部辭典收錄的台語詞目——也就是「這串漢字在台語裡是一個詞」。
+
+    這是決定要不要標音的訊號。詞在裡面，模型讀漢字就會念對（市場→tshi7-tiunn5），
+    標音是多餘的；不但多餘，還可能挑到比較口語的講法（tshi7-a2 市仔）而降低正式度。
+    詞不在裡面，這串漢字在台語不成詞，模型只能逐字硬念（東西、放進），非標不可。
+
+    四個聽測結果四項全中：市場/冰箱在裡面（不標），東西/放進不在（要標）。
+    """
+    if TAIGI_WORDS.exists():
+        return frozenset(json.loads(TAIGI_WORDS.read_text(encoding="utf-8")))
+    import pandas as pd
+    moe = pd.read_excel(KAUTIAN, engine="odf").dropna(subset=["漢字"])
+    words = {re.sub(r"【.*?】", "", str(h)).strip() for h in moe.漢字}
+    words.discard("")
+    TAIGI_WORDS.write_text(json.dumps(sorted(words), ensure_ascii=False), encoding="utf-8")
+    return frozenset(words)
+
+
 def segment(text: str, lex: dict[str, list[str]]):
     """最長詞優先切分。
 
@@ -116,7 +137,7 @@ def segment(text: str, lex: dict[str, list[str]]):
 
 
 def annotate(text: str, *, only_unambiguous: bool = True,
-             wordlist: set[str] | None = None):
+             wordlist: set[str] | None = None, skip_taigi_words: bool = True):
     """回傳（標好的文字, 改了哪些詞）。
 
     標音一律「換掉原字」。試過並列的寫法——「乾坤(khian5-khun1)」模型會念兩遍，
@@ -126,14 +147,19 @@ def annotate(text: str, *, only_unambiguous: bool = True,
                       不標至少還有模型自己的判斷，標錯是直接指定念錯。
                       多義詞要標的話交給 taigi_disambiguate.py
     wordlist          只標這些詞。給 None 表示標所有查得到的
+    skip_taigi_words  台語本來就有的詞不標，交給模型自己念（見 taigi_words）
     """
     lex = lexicon()
+    native = taigi_words() if skip_taigi_words else frozenset()
     pieces, changed = [], []
     for word, readings in segment(text, lex):
         if readings is None:
             pieces.append(word)
             continue
         if wordlist is not None and word not in wordlist:
+            pieces.append(word)
+            continue
+        if word in native:
             pieces.append(word)
             continue
         if only_unambiguous and len(readings) > 1:
@@ -154,6 +180,8 @@ def main() -> int:
     ap.add_argument("--all", action="store_true",
                     help="多義詞也標（取最常見的讀音）。預設只標唯一讀音的詞")
     ap.add_argument("--words", help="只標這些詞，逗號分隔")
+    ap.add_argument("--annotate-native", action="store_true",
+                    help="連台語本來就有的詞也標。預設不標，那些模型自己念得對")
     ap.add_argument("--show", action="store_true", help="列出改了哪些詞")
     a = ap.parse_args()
 
@@ -162,6 +190,7 @@ def main() -> int:
         text,
         only_unambiguous=not a.all,
         wordlist=set(a.words.split(",")) if a.words else None,
+        skip_taigi_words=not a.annotate_native,
     )
     print(out)
     if a.show:
