@@ -1,0 +1,370 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>台文對照表</title>
+<style>
+  :root { --bg:#12141a; --panel:#1a1d26; --line:#2a2f3d; --ink:#e6e8ee;
+          --muted:#8b93a7; --accent:#6ea8fe; --ok:#4ec9a5; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink);
+         font:15px/1.6 system-ui,"Noto Sans TC",sans-serif; }
+  header { padding:18px 24px; border-bottom:1px solid var(--line);
+           display:flex; justify-content:space-between; align-items:center; gap:16px; flex-wrap:wrap; }
+  h1 { margin:0; font-size:18px; font-weight:600; }
+  .sub { color:var(--muted); font-size:13px; }
+  a { color:var(--accent); }
+  main { padding:18px 24px; }
+  .bar { display:flex; gap:10px; flex-wrap:wrap; align-items:center; margin-bottom:14px; }
+  input, select { background:#0e1016; color:var(--ink); border:1px solid var(--line);
+                  border-radius:7px; padding:8px 10px; font:inherit; font-size:14px; }
+  input[type=search] { min-width:220px; }
+  #key { min-width:230px; }
+  button { background:var(--accent); color:#0b0d12; border:0; border-radius:7px;
+           padding:8px 14px; font:inherit; font-weight:600; cursor:pointer; }
+  button.ghost { background:transparent; color:var(--muted); border:1px solid var(--line); font-weight:400; }
+  button.ghost:hover { color:var(--ink); }
+  table { width:100%; border-collapse:collapse; font-size:14px; }
+  th { text-align:left; color:var(--muted); font-size:12px; font-weight:500;
+       padding:8px 10px; border-bottom:1px solid var(--line); position:sticky; top:0; background:var(--bg); }
+  td { padding:7px 10px; border-bottom:1px solid #1e2230; vertical-align:middle; }
+  tr:hover td { background:#181b24; }
+  .src { font-size:11px; padding:2px 8px; border-radius:20px; border:1px solid var(--line); color:var(--muted); }
+  .src.override { color:var(--ok); border-color:#2d5548; background:#16241c; }
+  .src.llm { color:#c9a7ff; border-color:#4c3c6b; }
+  .word { font-weight:600; }
+  .edit { width:130px; padding:5px 8px; font-size:14px; }
+  .why { color:var(--muted); font-size:12px; }
+  .msg { color:var(--ok); font-size:12px; margin-left:8px; }
+  .err { color:#ff8f8f; }
+  .counts { color:var(--muted); font-size:12px; }
+  .page { display:flex; gap:8px; align-items:center; margin-top:14px; color:var(--muted); font-size:13px; }
+  .tabs { display:flex; gap:6px; margin-bottom:16px; }
+  .tabs button { background:transparent; color:var(--muted); border:1px solid var(--line);
+                 font-weight:400; padding:7px 14px; }
+  .tabs button.on { background:var(--panel); color:var(--ink); border-color:#3d465c; }
+  .tabs .badge { background:#7c4a4a; color:#ffd6d6; border-radius:20px;
+                 padding:0 7px; margin-left:6px; font-size:11px; }
+  .tag2 { font-size:11px; padding:2px 8px; border-radius:20px; border:1px solid var(--line); color:var(--muted); }
+  .tag2.todo { color:#ffcf8f; border-color:#7c6a4a; background:#241f16; }
+  .tag2.done { color:var(--ok); border-color:#2d5548; background:#16241c; }
+  .samples { color:var(--muted); font-size:11px; }
+  .tag2.tailo { color:#c9a7ff; border-color:#4c3c6b; }
+  .acts { display:flex; gap:5px; align-items:center; }
+  .acts input { width:110px; padding:4px 7px; font-size:13px; }
+  .acts button { padding:4px 9px; font-size:12px; }
+  tr.done td { opacity:.5; }
+  .filt { display:flex; gap:8px; align-items:center; margin-bottom:12px; font-size:13px; color:var(--muted); }
+  .ab { margin-top:8px; padding:9px 11px; border-radius:7px; background:#0e1016;
+        border:1px solid var(--line); }
+  .ab .side { display:flex; align-items:center; gap:9px; margin-bottom:7px; }
+  .ab .side:last-child { margin-bottom:0; }
+  .ab .lab { font-size:11px; width:74px; flex:none; color:var(--muted); }
+  .ab .lab b { color:var(--ink); display:block; font-size:12px; }
+  .ab audio { height:32px; flex:1; }
+  .ab .txt { font-size:12px; color:var(--muted); }
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>台文對照表</h1>
+    <div class="sub">華語詞 → 台語漢字。<a href="/">回試聽台</a>　<span id="vernav"></span></div>
+  </div>
+  <div class="counts" id="counts"></div>
+</header>
+
+<main>
+  <div class="tabs">
+    <button id="tab_dict" class="on">對照表</button>
+    <button id="tab_sug">我的意見<span class="badge" id="sugn" hidden></span></button>
+  </div>
+
+  <div id="pane_sug" hidden>
+    <p class="counts" style="margin:0 0 10px">
+      在試聽台點「不好」時留下的紀錄。<b>填了建議不會自動生效</b>，要在這裡決定。
+      每一筆有三個出口：<b>套用</b>（可先改內容）、<b>排除</b>（不採用，可撤銷）、
+      或留著再想。<span class="tag2 tailo">台羅</span> 那些改的是讀音表，
+      套不進台文表，要另外處理。
+    </p>
+    <div class="filt">
+      <label><input type="checkbox" id="showdone"> 顯示已處理的</label>
+    </div>
+    <table>
+      <thead><tr>
+        <th style="width:110px">華語詞</th><th style="width:130px">你建議的</th>
+        <th style="width:130px">目前的</th><th style="width:90px">次數</th>
+        <th style="width:110px">狀態</th><th>出現在哪些句子</th>
+      </tr></thead>
+      <tbody id="sugrows"></tbody>
+    </table>
+    <h3 style="font-size:14px;color:var(--muted);font-weight:500;margin:26px 0 8px">
+      只點了「不好」、沒填答案的</h3>
+    <table><thead><tr>
+      <th style="width:110px">華語詞</th><th style="width:130px">目前的</th>
+      <th style="width:90px">次數</th><th>出現在哪些句子</th>
+    </tr></thead><tbody id="blamerows"></tbody></table>
+  </div>
+
+  <div id="pane_dict">
+  <div class="bar" style="border-bottom:1px solid var(--line);padding-bottom:14px;margin-bottom:14px">
+    <b style="font-size:13px">新增</b>
+    <input id="new_w" placeholder="華語詞" style="width:140px">
+    <span style="color:var(--muted)">→</span>
+    <input id="new_h" placeholder="台語漢字" style="width:140px">
+    <input id="new_why" placeholder="備註（選填）" style="width:200px">
+    <button id="add">新增</button>
+    <span class="counts">新增的詞會寫進「人工修正」層，對每個版本都生效</span>
+  </div>
+
+  <div class="bar">
+    <input type="search" id="q" placeholder="搜尋華語詞或台語寫法…">
+    <select id="layer">
+      <option value="">全部來源</option>
+      <option value="override">只看人工修正</option>
+      <option value="llm">只看 LLM 補的</option>
+      <option value="table">只看語料對齊</option>
+    </select>
+    <button id="go">搜尋</button>
+    <input type="password" id="key" placeholder="ADMIN_API_KEY（要改才需要）">
+    <button class="ghost" id="savekey">記住</button>
+    <span class="msg" id="msg"></span>
+  </div>
+
+  <table>
+    <thead><tr>
+      <th style="width:130px">華語詞</th>
+      <th style="width:150px">目前的台語寫法</th>
+      <th style="width:90px">來源</th>
+      <th style="width:200px">改成</th>
+      <th>備註</th>
+    </tr></thead>
+    <tbody id="rows"></tbody>
+  </table>
+
+  <div class="page">
+    <button class="ghost" id="prev">← 上一頁</button>
+    <span id="pageinfo"></span>
+    <button class="ghost" id="next">下一頁 →</button>
+  </div>
+  </div>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+let offset = 0, total = 0;
+const LIMIT = 100;
+// 版本從網址讀：/dicts 是目前生效的，/dicts/v1 指定底表
+const VERSION = (location.pathname.match(/^\/dicts\/(\w+)/) || [])[1] || "";
+
+$("key").value = localStorage.getItem("adminKey") || "";
+$("savekey").onclick = () => {
+  localStorage.setItem("adminKey", $("key").value.trim());
+  flash("金鑰已記在這台瀏覽器");
+};
+
+function flash(text, bad) {
+  const m = $("msg");
+  m.textContent = text;
+  m.className = bad ? "msg err" : "msg";
+  setTimeout(() => { m.textContent = ""; }, 3000);
+}
+
+async function load() {
+  const q = encodeURIComponent($("q").value.trim());
+  const layer = $("layer").value;
+  const r = await fetch(
+    `/api/dicts?q=${q}&layer=${layer}&limit=${LIMIT}&offset=${offset}&version=${VERSION}`);
+  const d = await r.json();
+  total = d.total;
+  $("counts").textContent =
+    `底表 ${d.counts.table.toLocaleString()}　LLM 補 ${d.counts.llm}　人工修正 ${d.counts.override}`;
+  $("vernav").innerHTML = "版本："
+    + [["", "目前生效"], ...d.versions.map(v => [v, v])].map(([v, label]) =>
+        v === VERSION ? `<b>${label}</b>`
+                      : `<a href="/dicts${v ? "/" + v : ""}">${label}</a>`).join(" · ");
+  $("pageinfo").textContent = total
+    ? `${offset + 1}–${Math.min(offset + LIMIT, total)} / ${total.toLocaleString()}`
+    : "沒有符合的詞";
+  $("rows").innerHTML = d.rows.map(row => `
+    <tr data-word="${esc(row.word)}">
+      <td class="word">${esc(row.word)}</td>
+      <td>${esc(row.hanji || "")}</td>
+      <td><span class="src ${row.source}">${
+        { override: "人工", llm: "LLM", table: "對齊" }[row.source]}</span></td>
+      <td>
+        <input class="edit" value="${esc(row.override || "")}" placeholder="${esc(row.hanji || "")}">
+        <button class="ghost save" style="padding:4px 9px;font-size:12px">存</button>
+      </td>
+      <td class="why">${esc(row.why || (row.source === "table" && row.table ? "語料對齊" : ""))}</td>
+    </tr>`).join("");
+  $("rows").querySelectorAll(".save").forEach(b => b.onclick = save);
+}
+
+async function save(ev) {
+  const tr = ev.target.closest("tr");
+  const word = tr.dataset.word;
+  const hanji = tr.querySelector(".edit").value.trim();
+  const key = $("key").value.trim();
+  if (!key) return flash("要改的話請先填 ADMIN_API_KEY", true);
+  if (!hanji) return flash("台語寫法不能空白", true);
+  const r = await fetch("/admin/table/override", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json", "Authorization": `Bearer ${key}` },
+    body: JSON.stringify({ word, hanji, why: "從 /dicts 頁面手動修正" }),
+  });
+  if (r.ok) { flash(`${word} → ${hanji} 已存`); load(); }
+  else flash(`存不了：${(await r.json()).detail || r.status}`, true);
+}
+
+$("add").onclick = async () => {
+  const word = $("new_w").value.trim(), hanji = $("new_h").value.trim();
+  const key = $("key").value.trim();
+  if (!key) return flash("要新增請先填 ADMIN_API_KEY", true);
+  if (!word || !hanji) return flash("華語詞與台語漢字都要填", true);
+  const r = await fetch("/admin/table/override", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json", "Authorization": `Bearer ${key}` },
+    body: JSON.stringify({ word, hanji, why: $("new_why").value.trim() || "從 /dicts 頁面新增" }),
+  });
+  if (r.ok) {
+    flash(`已新增 ${word} → ${hanji}`);
+    $("new_w").value = $("new_h").value = $("new_why").value = "";
+    $("q").value = word; offset = 0; load();
+  } else flash(`新增失敗：${(await r.json()).detail || r.status}`, true);
+};
+$("new_h").onkeydown = e => { if (e.key === "Enter") $("add").click(); };
+
+$("go").onclick = () => { offset = 0; load(); };
+$("q").onkeydown = e => { if (e.key === "Enter") { offset = 0; load(); } };
+$("layer").onchange = () => { offset = 0; load(); };
+$("prev").onclick = () => { offset = Math.max(0, offset - LIMIT); load(); };
+$("next").onclick = () => { if (offset + LIMIT < total) { offset += LIMIT; load(); } };
+
+async function loadSug() {
+  const d = await (await fetch("/api/suggestions")).json();
+  const b = $("sugn");
+  b.hidden = !d.todo; b.textContent = d.todo;
+  const show = $("showdone").checked;
+  const list = d.suggested.filter(e => show || e.todo);
+  $("sugrows").innerHTML = list.map(e => {
+    const state = e.applied ? '<span class="tag2 done">已套用</span>'
+                : e.dismissed ? '<span class="tag2">已排除</span>'
+                : e.nochange ? '<span class="tag2">建議維持原字</span>'
+                : '<span class="tag2 todo">待處理</span>';
+    const kind = e.applicable ? "" : '<span class="tag2 tailo">台羅</span>';
+    // 待處理的才給動作。內容可以先改再套——建議常常接近但不完全對
+    const acts = !e.todo
+      ? (e.dismissed
+          ? `<button class="ghost undo" data-w="${esc(e.word)}" data-h="${esc(e.suggest)}">撤銷排除</button>`
+          : "")
+      : (e.applicable
+          ? `<input class="ed" value="${esc(e.suggest)}">
+             <button class="apply" data-w="${esc(e.word)}">套用</button>
+             <button class="ghost hear" data-w="${esc(e.word)}"
+                     data-s="${esc(e.samples[0] || "")}">試聽比較</button>
+             <button class="ghost skip" data-w="${esc(e.word)}" data-h="${esc(e.suggest)}">排除</button>`
+          : `<button class="ghost skip" data-w="${esc(e.word)}" data-h="${esc(e.suggest)}">排除</button>`);
+    return `<tr class="${e.todo ? "" : "done"}">
+      <td class="word">${esc(e.word)} ${kind}</td>
+      <td>${esc(e.suggest)}</td>
+      <td>${esc(e.current ?? "（沒有）")}</td>
+      <td>${e.times}</td>
+      <td>${state}</td>
+      <td><div class="acts">${acts}</div>
+          <div class="samples" style="margin-top:4px">${e.samples.map(esc).join("<br>")}</div></td>
+    </tr>`;
+  }).join("") || `<tr><td colspan="6" class="counts">${
+      show ? "還沒有填過建議" : "沒有待處理的了 🎉（勾上面可以看已處理的）"}</td></tr>`;
+  $("blamerows").innerHTML = d.blamed_only.map(e => `<tr>
+      <td class="word">${esc(e.word)} ${e.applicable ? "" : '<span class="tag2 tailo">台羅</span>'}</td>
+      <td>${esc(e.current ?? "（沒有）")}</td>
+      <td>${e.times}</td><td class="samples">${e.samples.map(esc).join("<br>")}</td></tr>`
+  ).join("") || `<tr><td colspan="4" class="counts">沒有</td></tr>`;
+  const withKey = async (url, method, body, okmsg) => {
+    const key = $("key").value.trim();
+    if (!key) return flash("要動作請先填 ADMIN_API_KEY（在對照表頁籤）", true);
+    const r = await fetch(url, { method,
+      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${key}` },
+      body: JSON.stringify(body) });
+    if (r.ok) { flash(okmsg); loadSug(); }
+    else flash(`失敗：${(await r.json()).detail || r.status}`, true);
+  };
+  $("sugrows").querySelectorAll(".apply").forEach(b => b.onclick = () => {
+    const h = b.closest(".acts").querySelector(".ed").value.trim();
+    if (!h) return flash("台語寫法不能空白", true);
+    withKey("/admin/table/override", "PUT",
+            { word: b.dataset.w, hanji: h, why: "採用聽測建議" }, `已套用 ${b.dataset.w} → ${h}`);
+  });
+  // 生兩段：現在的 vs 改過的。同一個 seed、同一個音色，差異只有那個詞
+  $("sugrows").querySelectorAll(".hear").forEach(b => b.onclick = async () => {
+    const cell = b.closest("td");
+    const word = b.dataset.w;
+    const text = b.dataset.s;
+    const hanji = cell.querySelector(".ed").value.trim();
+    if (!text) return flash("這筆沒有記到例句，無法試聽", true);
+    if (!hanji) return flash("台語寫法不能空白", true);
+    const old = cell.querySelector(".ab");
+    if (old) old.remove();
+    b.disabled = true; b.textContent = "生成中…";
+    try {
+      const two = await Promise.all([null, { [word]: hanji }].map(ov => synth(text, ov)));
+      const box = document.createElement("div");
+      box.className = "ab";
+      box.innerHTML = two.map((r, i) => `
+        <div class="side">
+          <span class="lab">${i ? "<b>改成</b>" : "<b>現在</b>"}${i ? esc(hanji) : ""}</span>
+          <audio controls src="${r.url}"></audio>
+        </div>
+        <div class="txt">${esc(r.sent)}</div>`).join("");
+      cell.appendChild(box);
+    } catch (e) { flash(`試聽失敗：${e.message}`, true); }
+    b.disabled = false; b.textContent = "試聽比較";
+  });
+
+  $("sugrows").querySelectorAll(".skip").forEach(b => b.onclick = () =>
+    withKey("/admin/suggestions/dismiss", "POST",
+            { word: b.dataset.w, suggest: b.dataset.h, why: "在 /dicts 排除" },
+            `已排除 ${b.dataset.w}`));
+  $("sugrows").querySelectorAll(".undo").forEach(b => b.onclick = () =>
+    withKey("/admin/suggestions/dismiss", "POST",
+            { word: b.dataset.w, suggest: b.dataset.h, undo: true },
+            `已撤銷排除 ${b.dataset.w}`));
+}
+
+$("showdone").onchange = loadSug;
+
+$("tab_dict").onclick = () => {
+  $("tab_dict").classList.add("on"); $("tab_sug").classList.remove("on");
+  $("pane_dict").hidden = false; $("pane_sug").hidden = true;
+};
+$("tab_sug").onclick = () => {
+  $("tab_sug").classList.add("on"); $("tab_dict").classList.remove("on");
+  $("pane_sug").hidden = false; $("pane_dict").hidden = true;
+  loadSug();
+};
+
+// 固定 seed 與音色，兩段才有可比性——差異只能來自那個被換掉的詞
+async function synth(text, override) {
+  const fd = new URLSearchParams({
+    text, llm: "llm_v7_best", flow: "official", hift: "official",
+    annotate: "hanji", simplify: "full", seed: "7",
+    prompt_name: "taigi_male_drama1_025.wav",
+    preview_override: override ? JSON.stringify(override) : "",
+  });
+  const r = await fetch("/api/tts", { method: "POST", body: fd });
+  if (!r.ok) throw new Error(r.status);
+  const sent = decodeURIComponent(r.headers.get("X-Annotated-Text") || "");
+  return { url: URL.createObjectURL(await r.blob()), sent };
+}
+
+function esc(s) {
+  return String(s ?? "").replace(/[&<>"']/g,
+    c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+load();
+loadSug();   // 開頁就算好待處理筆數，讓紅點看得見
+</script>
+</body>
+</html>

@@ -236,6 +236,8 @@ def to_simplified(text: str, mode: str) -> tuple[str, int]:
     return out, sum(1 for a, b in zip(text, out) if a != b)
 
 
+import annotate_layer  # noqa: E402
+
 app = FastAPI(
     title="CosyVoice3 台語 TTS",
     version="1.0.0",
@@ -339,6 +341,9 @@ def variants():
         "t2s_full_entries": T2S_FULL_COUNT,
         "max_prompt_sec": MAX_PROMPT_SEC,
         "min_prompt_sec": MIN_PROMPT_SEC,
+        # 頁面的預設選擇。跟 /v1 掛的是同一組，換版本只要改 .env，
+        # 不必再回來改前端寫死的名字（先前寫死 llm_v2_best，早就過期了）。
+        "startup": dict(zip(PARTS, startup_model())),
     }
 
 
@@ -522,6 +527,15 @@ def tts(
     speed: float = Form(1.0),
     text_frontend: bool = Form(False),
     simplify: str = Form("none"),
+    # 標音層：none 原字／corpus 語料學出的讀音／gemini 多義詞問 Gemini。
+    # 整句換或整句不換，不做混排——混排 1/10 會幻覺。
+    annotate: str = Form("none"),
+    # 台文對照表用哪一版。v5 是目前的（對齊法，乾淨但覆蓋窄），v1 是辭典法
+    # （覆蓋廣但噪音多）。留著讓耳朵直接比，見 taigi_store.BASES。
+    hanji_table: str = Form(""),
+    # 這一次請求專用的替換，JSON {"華語詞":"台語漢字"}。用來試聽「改了會怎樣」，
+    # 不寫進任何一層——聽完滿意才用 /admin 真的寫進去。
+    preview_override: str = Form(""),
     # 長文自動分段。預設開啟——關掉的話 200 字以上就會生出一段講不完的音檔。
     # 要逐字對照的實驗才關（設 0）。
     max_chunk_chars: int = Form(MAX_CHUNK_CHARS),
@@ -537,7 +551,22 @@ def tts(
 
     if simplify not in ("none", "safe", "full"):
         raise HTTPException(400, f"simplify must be none/safe/full, got {simplify!r}")
-    text, swapped = to_simplified(text, simplify)
+    if annotate not in annotate_layer.MODES:
+        raise HTTPException(400, f"annotate must be one of {annotate_layer.MODES}, got {annotate!r}")
+    # 標音要在繁簡轉換之前：辭典的鍵是繁體，而換完之後剩下的漢字才需要轉簡。
+    try:
+        extra = json.loads(preview_override) if preview_override else None
+    except json.JSONDecodeError:
+        raise HTTPException(400, "preview_override 不是合法 JSON")
+    text, annotate_note, annotate_changed = annotate_layer.apply(
+        text, annotate, hanji_table or None, extra)
+    # 台文模式之後不能再繁簡轉換。繁簡轉換是為華語輸入設計的（避免罕見繁體字被
+    # 拆成位元組），但台語漢字轉簡體會被換成讀音不同的華語字——「連紲」變「连绁」，
+    # 紲 lian5-sua3 變成 绁 xiè，模型就唸成 lian5-sia。台羅模式沒事，因為那不是漢字。
+    if annotate.startswith("hanji"):
+        simplify, swapped = "none", 0
+    else:
+        text, swapped = to_simplified(text, simplify)
     unfixable = remaining_fragments(text)
 
     # Form(DEFAULT_INSTRUCT) only fires when the field is absent, but the page always
@@ -589,7 +618,7 @@ def tts(
             speed=speed, text_frontend=text_frontend, seed=seed,
             max_chunk_chars=0 if text_frontend else max_chunk_chars,
             comma_split=comma_split,
-            note=f"simplify={simplify}({swapped}字)"
+            note=f"simplify={simplify}({swapped}字) annotate={annotate_note}"
                  + (f" 仍是碎片[{unfixable}]" if unfixable else ""),
         )
         audio, sample_rate, used_seed = out.audio, out.sample_rate, out.seed
@@ -609,6 +638,9 @@ def tts(
             "X-Seed": str(used_seed),
             # 標頭只能放 latin-1，轉換後的文字要編碼才帶得過去
             "X-Simplify": f"{simplify};{swapped}",
+            "X-Annotate": quote(annotate_note),
+            "X-Annotated-Text": quote(text[:900]),
+            "X-Annotate-Changed": quote(json.dumps(annotate_changed, ensure_ascii=False)[:1800]),
             "X-Spoken-Text": quote(text),
             "X-Unfixable": quote(unfixable),
             "Access-Control-Expose-Headers":
@@ -622,6 +654,132 @@ async def unhandled(request, exc):
     """Surface the real message; the default 500 body says nothing useful."""
     log.exception("request failed")
     return JSONResponse(status_code=500, content={"detail": f"{type(exc).__name__}: {exc}"})
+
+
+class Feedback(BaseModel):
+    verdict: str                      # up 或 down
+    text: str                         # 原始華語
+    sent: str                         # 實際送進模型的文字
+    mode: str = "none"
+    changed: list = []                # [[華語詞, 台語漢字], ...]
+    blamed: list[str] = []            # 使用者指出哪幾個詞不對；空的就是未歸因
+    suggested: dict[str, str] = {}    # {華語詞: 正確寫法}，選填
+
+
+@app.get("/api/dicts")
+def dicts(q: str = "", layer: str = "", limit: int = 200, offset: int = 0,
+          version: str = ""):
+    """瀏覽對照表。唯讀，不需要權杖——內容不敏感，**改**它才需要（/admin）。
+
+    version 切底表（v1/v3/v4/v5）；不給就是目前生效的那份。人工修正與 LLM
+    補的那兩層對每個版本都生效，所以切版本只換底表。
+    """
+    import sys as _sys
+    _sys.path.insert(0, "/opt/CosyVoice/tools")
+    from taigi_store import BASES, layers
+    if version and version not in BASES:
+        raise HTTPException(404, f"沒有這個版本，可用的是 {sorted(BASES)}")
+    base, llm, over = layers(version or None)
+
+    def unwrap(v):
+        return v["hanji"] if isinstance(v, dict) else v
+
+    rows = []
+    for w in set(base) | set(llm) | set(over):
+        src = "override" if w in over else ("llm" if w in llm else "table")
+        if layer and src != layer:
+            continue
+        eff = unwrap(over.get(w)) or unwrap(llm.get(w)) or base.get(w)
+        if q and q not in w and q not in (eff or ""):
+            continue
+        rows.append({"word": w, "hanji": eff, "source": src,
+                     "table": base.get(w), "llm": unwrap(llm.get(w)),
+                     "override": unwrap(over.get(w)),
+                     "why": (over.get(w) or {}).get("why", "") if isinstance(over.get(w), dict) else ""})
+    # 人工修正排前面，那是最該被看見與複查的
+    rows.sort(key=lambda r: ({"override": 0, "llm": 1, "table": 2}[r["source"]], r["word"]))
+    import sys as _sys2
+    _sys2.path.insert(0, "/opt/CosyVoice/tools")
+    from taigi_store import BASES as _B
+    return {"total": len(rows),
+            "counts": {"table": len(base), "llm": len(llm), "override": len(over)},
+            "version": version or "目前生效", "versions": sorted(_B),
+            "rows": rows[offset:offset + limit]}
+
+
+@app.get("/api/suggestions")
+def suggestions():
+    """看得到自己填過什麼。唯讀、不需要金鑰——這是意見，不是設定。
+
+    同一個詞被建議多次就合併，次數多的排前面；已經套用進表的標出來，
+    才分得清「還沒處理」和「處理過了」。
+    """
+    import sys as _sys
+    _sys.path.insert(0, "/opt/CosyVoice/tools")
+    from taigi_store import FEEDBACK, dismissed, merged
+    now, gone = merged(), dismissed()
+    agg: dict = {}
+    down_only: dict = {}
+    try:
+        for line in FEEDBACK.read_text(encoding="utf-8").splitlines():
+            row = json.loads(line)
+            if row.get("verdict") != "down":
+                continue
+            # 台文與台羅改的是不同的表，混在一起會套錯地方——「氣壓」在 hanji
+            # 被點 5 次、在 corpus 被點 2 次，那是兩件不同的事。
+            kind = "hanji" if str(row.get("mode", "")).startswith("hanji") else "tailo"
+            for w, h in (row.get("suggested") or {}).items():
+                k = (w, h, kind)
+                e = agg.setdefault(k, {"word": w, "suggest": h, "kind": kind,
+                                       "times": 0, "samples": []})
+                e["times"] += 1
+                if len(e["samples"]) < 3 and row.get("text"):
+                    e["samples"].append(row["text"][:40])
+            for w in row.get("blamed", []):
+                if not (row.get("suggested") or {}).get(w):
+                    d = down_only.setdefault((w, kind),
+                                             {"word": w, "kind": kind, "times": 0, "samples": []})
+                    d["times"] += 1
+                    if len(d["samples"]) < 3 and row.get("text"):
+                        d["samples"].append(row["text"][:40])
+    except OSError:
+        pass
+    for e in agg.values():
+        # 台羅的建議套不進台文表，標出來讓人知道那要另外處理
+        e["applicable"] = e["kind"] == "hanji"
+        e["current"] = now.get(e["word"])
+        e["applied"] = now.get(e["word"]) == e["suggest"]
+        e["nochange"] = e["suggest"] == e["word"]
+        e["dismissed"] = f"{e['word']}→{e['suggest']}" in gone
+        e["todo"] = not (e["applied"] or e["dismissed"] or e["nochange"])
+    for d in down_only.values():
+        d["current"] = now.get(d["word"])
+        d["applicable"] = d["kind"] == "hanji"
+    # 排除過的沉到最後，跟已套用的一樣算「處理完了」
+    rank = sorted(agg.values(), key=lambda e: (not e["todo"], -e["times"]))
+    return {"suggested": rank,
+            "todo": sum(1 for e in rank if e["todo"]),
+            "blamed_only": sorted(down_only.values(), key=lambda d: -d["times"])}
+
+
+@app.post("/api/feedback")
+def feedback(fb: Feedback):
+    """點讚點爛。
+
+    整句生成、一個詞爛就整句爛——所以未歸因的負評也要收：同一個詞出現在很多
+    爛句子、很少好句子，統計上就浮得出來。blamed 只是加速這個過程。
+    """
+    if fb.verdict not in ("up", "down"):
+        raise HTTPException(400, "verdict must be up or down")
+    import sys as _sys
+    _sys.path.insert(0, "/opt/CosyVoice/tools")
+    from taigi_store import log_feedback
+    ok = log_feedback(verdict=fb.verdict, text=fb.text, sent=fb.sent,
+                      mode=fb.mode, changed=fb.changed, blamed=fb.blamed,
+                      suggested=fb.suggested)
+    if not ok:
+        raise HTTPException(503, "回饋寫不進去，檢查 TAIGI_DATA 掛載")
+    return {"ok": True}
 
 
 @app.get("/api/prompt/{name}")
@@ -654,6 +812,27 @@ app.include_router(public_api.create_router(
     instruct=DEFAULT_INSTRUCT,
 ))
 app.add_exception_handler(public_api.ApiError, public_api.api_error_handler)
+
+# /admin 改的是全站共用的對照表，權杖跟 /v1 分開——合成的權限不該順便帶著
+# 「改變所有人發音」的權限。沒設 ADMIN_API_KEY 就整組不掛載（不是 401，是不存在）。
+import admin_api  # noqa: E402
+if admin_api.ADMIN_KEY:
+    app.include_router(admin_api.router)
+else:
+    log.info("ADMIN_API_KEY 未設定，/admin 維護端點不掛載")
+
+@app.get("/dicts", include_in_schema=False)
+@app.get("/dicts/{version}", include_in_schema=False)
+def dicts_page(version: str = ""):
+    """/dicts 是目前生效的表，/dicts/v1 之類是指定底表版本。
+
+    StaticFiles 只認 /dicts.html，這裡補乾淨的路徑；版本由頁面自己從網址讀。
+    """
+    # 這頁還在頻繁改，瀏覽器快取住舊版會讓人以為功能不見了（實際發生過：
+    # 加了「我的意見」頁籤，/dicts/v5 卻還顯示舊版）。明講不要快取。
+    return FileResponse(STATIC_DIR / "dicts.html",
+                        headers={"Cache-Control": "no-cache, must-revalidate"})
+
 
 # 這一行要放在所有路由之後：掛在 "/" 的 StaticFiles 會接住剩下的一切。
 app.mount("/", StaticFiles(directory=STATIC_DIR, html=True), name="static")

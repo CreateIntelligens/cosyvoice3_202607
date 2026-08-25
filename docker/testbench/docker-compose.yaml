@@ -31,6 +31,13 @@ services:
       # loss 最低（1.352）卻連 155 字都講不完。詳見
       # reports/taigi-tailo-scaling-2026-08-20.md
       TTS_API_LLM: ${TTS_API_LLM:-llm_v7_best}
+      # 標音層的 gemini 模式要用。沒設的話那個選項會自動退回語料預設。
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-3.5-flash-lite}
+      # 未知詞、點讚點爛、LLM 補的表都寫這裡。repo 是唯讀掛載，寫不進去。
+      TAIGI_DATA: /data/taigi
+      # /admin 用的權杖，跟 TTS_API_KEY 分開。沒設就不掛載那組端點。
+      ADMIN_API_KEY: ${ADMIN_API_KEY:-}
       TTS_API_FLOW: ${TTS_API_FLOW:-official}
       TTS_API_HIFT: ${TTS_API_HIFT:-official}
     # This host already runs 55 containers across 33 bridge networks and Docker's
@@ -47,6 +54,8 @@ services:
       # models/ would dangle inside the container. Mount the real directory on top.
       - ${BASE_MODEL_DIR:-../../workspace/cosyvoice3_smoke_10spk/models/Fun-CosyVoice3-0.5B}:/models/base:ro
       - testbench-variants:/tmp/cosyvoice-variants
+      # 分層表與回饋紀錄。跟 repo 分開，重建底表不會動到這裡面的東西。
+      - ./data:/data/taigi
     shm_size: "8gb"
     restart: unless-stopped
     deploy:

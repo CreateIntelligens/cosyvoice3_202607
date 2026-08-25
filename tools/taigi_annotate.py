@@ -82,9 +82,25 @@ def build_lexicon() -> dict[str, list[str]]:
         counts.setdefault(hoa, {})
         counts[hoa][kip] = counts[hoa].get(kip, 0) + 1
 
-    # 同一個詞出現愈多次，代表愈是主流講法——多義時當作預設
-    return {w: [k for k, _ in sorted(v.items(), key=lambda kv: -kv[1])]
-            for w, v in counts.items()}
+    lex = {w: [k for k, _ in sorted(v.items(), key=lambda kv: -kv[1])]
+           for w, v in counts.items()}
+
+    # 台華線頂是「詞彙」對照典，沒有單字條目——「十」「三」「沒」全查不到，
+    # 整句換不掉就整句退回，覆蓋率被這些常用字卡死。教育部辭典有，補進來。
+    import re as _re
+    from tailo import to_numeric
+    moe = pd.read_excel(KAUTIAN, engine="odf").dropna(subset=["漢字", "羅馬字"])
+    for han, roman in zip(moe.漢字, moe.羅馬字):
+        han = _re.sub(r"【.*?】", "", str(han)).strip()
+        num = to_numeric(_re.sub(r"【.*?】", "", str(roman)).strip())
+        if not han or not num or "/" in num or not HAN.search(han):
+            continue
+        if len(han) > MAX_WORD or not _looks_clean(num):
+            continue
+        lex.setdefault(han, [])
+        if num not in lex[han]:
+            lex[han].append(num)
+    return lex
 
 
 @lru_cache(maxsize=1)
@@ -116,16 +132,27 @@ def taigi_words() -> frozenset[str]:
     return frozenset(words)
 
 
+NUMERAL = set("零一二三四五六七八九十百千萬兩0123456789")
+CLASSIFIER = set("個个隻張條本台間位次件顆杯碗盤床把塊份組份年月日點分秒歲")
+
+
 def segment(text: str, lex: dict[str, list[str]]):
     """最長詞優先切分。
 
     逐字查是行不通的：「乾坤」拆開查會得到 kan1（乾燥的乾）+ khun1，
     而整個詞查是 khian5-khun1。破音字要的是詞層級的知識。
+
+    但最長優先會反咬：「六個人」裡的「個人」是辭典詞（個體、個人），於是切成
+    六＋個人，唸出來變成 lak8 ko3-jin5。數詞後面的量詞要單獨切開。
     """
     out, i = [], 0
     while i < len(text):
+        prev_num = i > 0 and text[i - 1] in NUMERAL
         for n in range(min(MAX_WORD, len(text) - i), 0, -1):
             w = text[i:i + n]
+            # 數詞後面接量詞時，量詞不跟後面的字黏成詞
+            if n > 1 and prev_num and w[0] in CLASSIFIER:
+                continue
             if w in lex:
                 out.append((w, lex[w]))
                 i += n
@@ -136,7 +163,42 @@ def segment(text: str, lex: dict[str, list[str]]):
     return out
 
 
-CLAUSE = re.compile(r"[^，。！？；：、\n]+|[，。！？；：、\n]+")
+# 全有全無的單位是「整句」（句號為界），不是子句。以子句為單位的話，
+# 「桌上有六個蘋果，我拿了三個。」前半換得掉、後半換不掉，結果同一個句子裡
+# 台羅與漢字並存——那正是 1/10 會幻覺的混排形態。
+SENTENCE = re.compile(r"[^。！？\n]+[。！？\n]*|[。！？\n]+")
+
+
+CORPUS_PRIOR = ROOT / "workspace/chhoetaigi/corpus_prior.json"
+
+
+@lru_cache(maxsize=1)
+def corpus_prior() -> dict[str, str]:
+    """每個詞在真實台語文本裡最常用的讀音。
+
+    從 naer 的 107,292 句雙寫法學出來的：華語那側切出詞，看台語那側實際寫成
+    什麼。3,717 個詞。這比辭典詞頻準得多，因為辭典數的是「有幾個詞條」，
+    語料數的是「人實際上怎麼講」。
+
+        辭典詞頻    46.1%
+        語料預設    86.6%      ← 零 API 呼叫
+
+    它不看句子，所以「我 vs 阮」這種要看上下文的救不到。天花板 94.2%，
+    剩下 5.8% 加上沒學過的詞（9.1%）才需要問 LLM。
+    """
+    if CORPUS_PRIOR.exists():
+        return json.loads(CORPUS_PRIOR.read_text(encoding="utf-8"))
+    return {}
+
+
+def by_corpus(word: str, readings: list[str]) -> str:
+    """語料學出來的預設，學不到就退回辭典詞頻。
+
+    預設表裡的讀音來自教育部辭典，**不要求它出現在台華線頂的候選清單裡**。
+    那份清單對「台語用哪個詞」有用，對「那個詞怎麼念」不權威——「影響」它只
+    收 ing2-hiang2，教育部是 ing2-hiong2，而後者才是對的。
+    """
+    return corpus_prior().get(word) or readings[0]
 
 
 def most_frequent(word: str, readings: list[str]) -> str:
@@ -154,7 +216,21 @@ def most_frequent(word: str, readings: list[str]) -> str:
     return readings[0]
 
 
-def annotate_clause_wise(text: str, *, only_unambiguous: bool = False, pick=most_frequent):
+# v7 看過的台羅長這樣：「Gua2 thiann1 li2 leh4 khau3-iau1.」
+# 半形標點 5,700 次、全形只有 15 次，而且句首大寫。送全形＋全小寫等於送它
+# 沒見過的格式，聽起來會像把詞硬黏在一起——那不是選詞的問題，是格式的問題。
+_FULLWIDTH = str.maketrans({"，": ",", "。": ".", "！": "!", "？": "?",
+                            "；": ";", "：": ":", "、": ","})
+
+
+def _as_trained(line: str) -> str:
+    line = line.translate(_FULLWIDTH)
+    line = re.sub(r"\s+([,.!?;:])", r"\1", line)      # 標點前不留空格
+    line = re.sub(r"([,.!?;:])(?=\S)", r"\1 ", line)   # 標點後留一個空格
+    return re.sub(r"^([a-z])", lambda m: m.group(1).upper(), line.strip())
+
+
+def annotate_clause_wise(text: str, *, only_unambiguous: bool = False, pick=by_corpus):
     """整句標，或整句不標——不產生漢字與台羅混在一起的句子。
 
     量過 10 個 seed：混排 1/10 會幻覺（3.5 秒的句子生出 21.6 秒），純漢字與
@@ -163,13 +239,13 @@ def annotate_clause_wise(text: str, *, only_unambiguous: bool = False, pick=most
     一個子句裡只要有一個詞查不到讀音，整句原樣保留。這讓覆蓋率變低，但低覆蓋率
     是安全的失敗——不標就是現在 v7 的行為，而混排會生出幻覺。
 
-    pick  怎麼從多個讀音裡挑一個。預設按辭典出現次數，而那**選得很差**，
-          見 most_frequent。要挑對就傳 taigi_disambiguate 的 resolver 進來。
+    pick  怎麼從多個讀音裡挑一個。預設用語料學出的讀音（by_corpus，86.6%）。
+          要再上去得看句子，那是 taigi_disambiguate 的工作。
     """
     lex = lexicon()
     out, changed = [], []
-    for clause in CLAUSE.findall(text):
-        if not clause.strip() or CLAUSE.match(clause) and not re.search(r"\w", clause):
+    for clause in SENTENCE.findall(text):
+        if not clause.strip() or not re.search(r"[一-鿿]", clause):
             out.append(clause)
             continue
         words = segment(clause, lex)
@@ -178,15 +254,23 @@ def annotate_clause_wise(text: str, *, only_unambiguous: bool = False, pick=most
         for word, readings in words:
             if not word.strip():
                 continue
-            if readings is None or (only_unambiguous and len(readings) > 1):
+            if readings is None:
+                # 標點原樣留著，它不是查不到讀音的字
+                if not re.search(r"[一-鿿A-Za-z0-9]", word):
+                    resolved.append((word, word))
+                    continue
+                resolved = None
+                break
+            if only_unambiguous and len(readings) > 1:
                 resolved = None
                 break
             resolved.append((word, pick(word, readings)))
         if resolved is None:
             out.append(clause)
             continue
-        out.append(" ".join(k for _, k in resolved))
-        changed.extend((w, k, len(lex[w])) for w, k in resolved)
+        out.append(_as_trained(" ".join(k for _, k in resolved)))
+        changed.extend((w, k, len(lex.get(w, [k]))) for w, k in resolved
+                       if re.search(r"[一-鿿]", w))
     text = re.sub(r" +([，。！？；：、])", r"\1", "".join(out))
     return text.strip(), changed
 
@@ -257,11 +341,11 @@ def main() -> int:
         )
     else:
         out, changed = annotate_clause_wise(text, only_unambiguous=a.strict)
-        ambiguous = sum(1 for _, _, n in changed if n > 1)
-        if ambiguous:
-            print(f"  警告：{ambiguous} 個詞是按辭典出現次數挑的，那個挑法會錯"
-                  f"（把→lak8、冰箱→ping1-kui7）。要挑對請用 taigi_disambiguate.py",
-                  file=sys.stderr)
+        prior = corpus_prior()
+        guessed = [w for w, _, n in changed if n > 1 and w not in prior]
+        if guessed:
+            print(f"  警告：{len(guessed)} 個詞語料裡沒學過，退回辭典詞頻（那個挑法會錯）"
+                  f"：{'、'.join(guessed[:6])}", file=sys.stderr)
     print(out)
     if a.show:
         for w, k, n in changed:

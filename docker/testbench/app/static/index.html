@@ -44,6 +44,27 @@
   .tag.seed:hover { background: #2d5548; color: #eafff8; }
   .tag.t2s { color: #c9a7ff; border-color: #4c3c6b; }
   .tag.bad { color: #ffb3b3; border-color: #7c4a4a; }
+  .tag.cv { color: #8fd6ff; border-color: #35566b; }
+  .vote { display: flex; gap: 6px; align-items: center; margin-top: 8px; }
+  .vote button { width: auto; margin: 0; padding: 4px 11px; font-size: 12px; font-weight: 400;
+                 background: transparent; color: var(--muted); border: 1px solid var(--line); }
+  .vote button:hover { color: var(--ink); border-color: #3d465c; }
+  .vote button.on.up { color: var(--ok); border-color: #2d5548; background: #16241c; }
+  .vote button.on.down { color: #ffb3b3; border-color: #7c4a4a; background: #241618; }
+  .vote .done { font-size: 11px; color: var(--muted); }
+  .blame { margin-top: 7px; padding: 8px 10px; border-radius: 7px; background: #0e1016;
+           border: 1px solid var(--line); }
+  .blame p { margin: 0 0 6px; font-size: 11px; color: var(--muted); }
+  .blame button { width: auto; margin: 0 5px 5px 0; padding: 3px 9px; font-size: 11px;
+                  font-weight: 400; background: transparent; color: var(--muted);
+                  border: 1px solid var(--line); border-radius: 20px; }
+  .blame button.on { color: #ffb3b3; border-color: #7c4a4a; background: #241618; }
+  .fix { display: flex; gap: 6px; align-items: center; margin-top: 6px; }
+  .fix input { width: 130px; padding: 4px 8px; font-size: 12px; }
+  .fix span { font-size: 11px; color: var(--muted); }
+  .fix .ok { color: var(--ok); font-size: 11px; opacity: 0; transition: opacity .15s; }
+  .fix .ok.show { opacity: 1; }
+  .fix input.saved { border-color: #2d5548; }
   .spoken { margin-top: 8px; font-size: 13px; }
   .spoken summary { color: var(--muted); cursor: pointer; font-size: 12px; }
   .spoken summary:hover { color: var(--ink); }
@@ -86,6 +107,7 @@
 <header>
   <h1>CosyVoice3 台語模型試聽台</h1>
   <div class="sub" id="health">載入中…</div>
+  <div class="sub"><a href="/dicts" style="color:#6ea8fe">台文對照表 →</a></div>
 </header>
 
 <main>
@@ -101,6 +123,23 @@
 
     <label>華語文字</label>
     <textarea id="text">明天早上九點，我們一起去市場買東西。</textarea>
+    <label>文字轉換</label>
+    <select id="annotate">
+      <option value="none" selected>不轉換（原字送進去）</option>
+      <option value="hanji">轉台文（查表）</option>
+      <option value="hanji_llm">轉台文（查表＋Gemini）</option>
+      <option value="corpus">轉台羅（查表）</option>
+      <option value="gemini">轉台羅（查表＋Gemini 挑文白）</option>
+    </select>
+    <label>台文對照表版本</label>
+    <select id="hanji_table">
+      <option value="" selected>v5 目前（對齊法，1,240 詞）</option>
+      <option value="v1">v1 辭典法（23,486 詞）</option>
+    </select>
+    <div class="hint">只影響「轉台文」那兩個模式。<b>v5</b> 是統計對齊出來的，乾淨但只涵蓋 naer 的語域（氣象、廣播、日常），文言幾乎命中不到。<b>v1</b> 是辭典法，覆蓋廣得多但噪音重（走找、條飛、烏白都是它的產物）。人工修正那層對每個版本都生效。</div>
+
+    <div class="hint"><b>台文</b>把華語詞換成台語漢字（颱風→風颱、東西→物件、把→共），輸出仍是漢字。v6 用 naer 290 小時訓練，而 naer 的原文就是台語漢字——這是模型的訓練分布本身，語調跟不轉換一樣自然。<b>台羅</b>換成羅馬拼音，詞更精準，但 v7 只學過 4.62 小時台羅，唸起來偏硬，而且漢字夾在台羅中間 1/10 會幻覺，所以是整句換或整句不換。查表用台華線頂＋教育部推薦用字＋naer 語料統計（23,484 詞）；加 Gemini 是補功能詞與句法（把→共、了→矣、他→伊），辭典結果會當提示餵給它，它改寫過頭就退回查表。送進模型的實際文字顯示在結果上。</div>
+
     <label>繁體字轉簡體字形</label>
     <select id="simplify">
       <option value="none">不轉換</option>
@@ -208,9 +247,12 @@ async function init() {
     ]);
     meta = v;
     // flow 預設 official：實測微調版與原始模型幾乎聽不出差別（見 v3-C）
-    fill($("llm"), v.parts.llm, "llm_v2_best");
-    fill($("flow"), v.parts.flow, "official");
-    fill($("hift"), v.parts.hift, "official");
+      // 預設跟伺服器起始的那組一致（也就是 /v1 對外用的那組），由伺服器決定，
+      // 不要在這裡寫死——先前寫死 llm_v2_best，早就過期了。
+      const start = v.startup || {};
+      fill($("llm"), v.parts.llm, start.llm || "official");
+      fill($("flow"), v.parts.flow, start.flow || "official");
+      fill($("hift"), v.parts.hift, start.hift || "official");
     $("instruct").value = v.default_instruct;
     DEFAULT_INSTRUCT = v.default_instruct;
     const opt = $("simplify").options;
@@ -265,6 +307,8 @@ $("go").onclick = async () => {
   fd.append("hift", $("hift").value);
   fd.append("instruct", $("instruct").value);
   fd.append("simplify", $("simplify").value);
+  fd.append("annotate", $("annotate").value);
+  fd.append("hanji_table", $("hanji_table").value);
   fd.append("speed", $("speed").value);
   fd.append("text_frontend", $("text_frontend").value);
   const rawSeed = $("seed").value.trim();
@@ -297,6 +341,9 @@ $("go").onclick = async () => {
       prompt: file ? file.name : $("prompt_name").value,
       uploaded: !!file,
       simplify: res.headers.get("X-Simplify") || "none;0",
+      annotate: decodeURIComponent(res.headers.get("X-Annotate") || "none"),
+      annotatedText: decodeURIComponent(res.headers.get("X-Annotated-Text") || ""),
+      changed: JSON.parse(decodeURIComponent(res.headers.get("X-Annotate-Changed") || "[]")),
       spoken: decodeURIComponent(res.headers.get("X-Spoken-Text") || ""),
       unfixable: decodeURIComponent(res.headers.get("X-Unfixable") || ""),
     });
@@ -324,10 +371,13 @@ function addResult(r) {
       <span class="tag">耗時 ${r.elapsed}s</span>
       <span class="tag seed" data-seed="${r.seed}" title="點一下沿用這個 seed">seed ${r.seed}</span>
       ${simplifyTag(r)}
+        ${annotateTag(r)}
     </div>
     <audio controls src="${r.url}"></audio>
-    ${spokenBlock(r)}`;
-  $("results").prepend(el);
+    ${spokenBlock(r)}
+      ${voteBlock(r)}`;
+    wireVote(el, r);
+    $("results").prepend(el);
 }
 
 // 轉換過就標出來，並讓實際送進模型的文字可以展開查看——差異往往只有一兩個字，
@@ -340,10 +390,108 @@ function simplifyTag(r) {
        + (r.unfixable ? `<span class="tag bad">仍是碎片 ${escapeHtml(r.unfixable)}</span>` : "");
 }
 
+function annotateTag(r) {
+  const a = r.annotate || "none";
+  if (a === "none") return "";
+  const failed = a.includes("failed") || a.includes("unavailable");
+  const label = { hanji: "台文", hanji_llm: "台文＋LLM",
+                  corpus: "台羅", gemini: "台羅＋LLM" };
+  const kind = a.split(/[:\-]/)[0];
+  return `<span class="tag ${failed ? "bad" : "cv"}" title="${escapeHtml(a)}">`
+       + `${label[kind] || kind}${failed ? " 已退回" : ""}</span>`;
+}
+
 function spokenBlock(r) {
-  if (!r.spoken || r.spoken === r.text) return "";
+  // 轉換後的文字跟繁簡轉換後的文字放在同一個摺疊區，不要在標籤列裡另開一塊
+  const shown = r.annotatedText && r.annotatedText !== r.text ? r.annotatedText : r.spoken;
+  if (!shown || shown === r.text) return "";
   return `<details class="spoken"><summary>實際送進模型的文字</summary>`
-       + `<div>${escapeHtml(r.spoken)}</div></details>`;
+       + `<div>${escapeHtml(shown)}</div></details>`;
+}
+
+function voteBlock(r) {
+  // 每一種模式都能評，包括不轉換。不轉換時評的是模型本身，那一樣是訊號——
+  // 而且要比較「轉換有沒有比較好」，兩邊都得評得起來才比得出來。
+  return `<div class="vote">
+      <button class="up" data-v="up">👍 好</button>
+      <button class="down" data-v="down">👎 不好</button>
+      <span class="done"></span>
+    </div><div class="blame" hidden></div>`;
+}
+
+function wireVote(el, r) {
+  const box = el.querySelector(".vote");
+  if (!box) return;
+  const blame = el.querySelector(".blame");
+  const done = box.querySelector(".done");
+  const changed = r.changed || [];
+  let picked = [];
+
+  let suggested = {};
+
+  // 知道正確答案就順手填，不填也照樣記錄——強迫填會讓人乾脆不點
+  const renderFix = () => {
+    const old = blame.querySelector(".fixwrap");
+    if (old) old.remove();
+    if (!picked.length) return;
+    const wrap = document.createElement("div");
+    wrap.className = "fixwrap";
+    wrap.innerHTML = picked.map(w =>
+      `<div class="fix"><span>${escapeHtml(w)} 應該是</span>`
+      + `<input data-w="${escapeHtml(w)}" placeholder="正確寫法（可留空）"`
+      + ` value="${escapeHtml(suggested[w] || "")}">`
+      + `<span class="ok">✓ 已存</span></div>`).join("");
+    blame.appendChild(wrap);
+    wrap.querySelectorAll("input").forEach(inp => {
+      const commit = () => {
+        const v = inp.value.trim();
+        if (v) suggested[inp.dataset.w] = v; else delete suggested[inp.dataset.w];
+        send("down");
+        // 存好了要看得到，不然會以為還要按什麼鍵
+        const tick = inp.nextElementSibling;
+        inp.classList.toggle("saved", !!v);
+        if (v) { tick.classList.add("show"); setTimeout(() => tick.classList.remove("show"), 1600); }
+      };
+      inp.onchange = commit;
+      inp.onkeydown = e => { if (e.key === "Enter") { e.preventDefault(); inp.blur(); } };
+    });
+  };
+
+  const send = async (verdict) => {
+    try {
+      await fetch("/api/feedback", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ verdict, text: r.text, sent: r.annotatedText || r.spoken || r.text,
+                               mode: r.annotate, changed, blamed: picked, suggested }),
+      });
+      const n = Object.keys(suggested).length;
+      done.textContent = picked.length
+        ? `已記錄（指出 ${picked.length} 個詞${n ? `，附 ${n} 個正確答案` : ""}）` : "已記錄";
+    } catch (e) { done.textContent = "記錄失敗"; }
+  };
+
+  box.querySelectorAll("button").forEach(btn => btn.onclick = () => {
+    box.querySelectorAll("button").forEach(b => b.classList.remove("on"));
+    btn.classList.add("on");
+    const v = btn.dataset.v;
+    send(v);
+    // 整句生成，一個詞爛就整句爛——所以點爛之後讓他指出是哪個詞，
+    // 不指也沒關係，未歸因的負評累積起來一樣看得出哪個詞常出問題。
+    if (v === "down" && changed.length) {
+      blame.hidden = false;
+      blame.innerHTML = `<p>哪個詞不對？（可不選，直接跳過；選了可以再填正確寫法）</p>` + changed.map(
+        ([hoa, tai], i) => `<button data-i="${i}">${escapeHtml(hoa)} → ${escapeHtml(tai)}</button>`
+      ).join("");
+      blame.querySelectorAll("button").forEach(b => b.onclick = () => {
+        b.classList.toggle("on");
+        picked = [...blame.querySelectorAll("button.on")].map(x => changed[x.dataset.i][0]);
+        renderFix();
+        send("down");
+      });
+    } else {
+      blame.hidden = true;
+    }
+  });
 }
 
 function escapeHtml(s) {

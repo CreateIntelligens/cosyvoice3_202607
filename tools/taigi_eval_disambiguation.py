@@ -58,9 +58,16 @@ def items(limit: int):
             for word, cands in segment(hoa, lex):
                 if not cands or len(cands) < 2:
                     continue
-                gold = [c for c in cands if any(h and h in tai for h in k2h.get(c, ()))]
-                if len(gold) == 1:
-                    yield hoa, word, cands[:8], gold[0]
+                # 取「最長的命中」，不是「唯一的命中」。句子裡有物件時，物 與
+                # 物件 兩個都算命中——要求唯一會把這 228 筆全丟掉，只留下寫「物」
+                # 的 42 筆，於是短的那個假贏。這個偏誤會系統性偏向短讀音。
+                best, best_len = None, 0
+                for c in cands:
+                    for h in k2h.get(c, ()):
+                        if h and h in tai and len(h) > best_len:
+                            best, best_len = c, len(h)
+                if best:
+                    yield hoa, word, cands[:8], best
 
 
 def evaluate(pick=None, limit: int = 20000):
