@@ -638,13 +638,21 @@ def tts(
             "X-Seed": str(used_seed),
             # 標頭只能放 latin-1，轉換後的文字要編碼才帶得過去
             "X-Simplify": f"{simplify};{swapped}",
+            # 音色名要回報。否則前端只能記自己送出時的下拉選單值，而那份會在
+            # 合成期間被使用者換掉——卡片就標成「現在選的」而不是「這段實際用的」。
+            "X-Prompt-Name": quote(prompt_name or ""),
             "X-Annotate": quote(annotate_note),
             "X-Annotated-Text": quote(text[:900]),
             "X-Annotate-Changed": quote(json.dumps(annotate_changed, ensure_ascii=False)[:1800]),
             "X-Spoken-Text": quote(text),
             "X-Unfixable": quote(unfixable),
-            "Access-Control-Expose-Headers":
-                "X-Variant, X-Duration-Sec, X-Seed, X-Simplify, X-Spoken-Text, X-Unfixable",
+            # 沒列進來的 header 瀏覽器讀不到，前端就會安靜地退回預設值。
+            # 加新 header 時這裡要一起加——先前 X-Annotate 那組就漏過。
+            "Access-Control-Expose-Headers": ", ".join((
+                "X-Variant", "X-Duration-Sec", "X-Seed", "X-Simplify",
+                "X-Spoken-Text", "X-Unfixable", "X-Prompt-Name",
+                "X-Annotate", "X-Annotated-Text", "X-Annotate-Changed",
+            )),
         },
     )
 

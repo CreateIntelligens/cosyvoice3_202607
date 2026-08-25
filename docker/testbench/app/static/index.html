@@ -321,6 +321,16 @@ $("go").onclick = async () => {
   if (file) fd.append("prompt_wav", file);
   else fd.append("prompt_name", $("prompt_name").value);
 
+  // 送出前把表單值拍下來。addResult 在 await 之後才跑，那時候使用者可能已經
+  // 換過音色或模型了——先前就是直接讀當下的下拉選單，於是卡片標的是「現在選的」
+  // 而不是「這段音檔實際用的」，聽測時會據此下錯結論。
+  const snap = {
+    text,
+    llm: $("llm").value, flow: $("flow").value, hift: $("hift").value,
+    prompt: file ? file.name : $("prompt_name").value,
+    uploaded: !!file,
+  };
+
   $("go").disabled = true;
   const started = performance.now();
   $("status").textContent = "合成中…（切換 checkpoint 時要重新載入模型，第一次會比較久）";
@@ -334,12 +344,14 @@ $("go").onclick = async () => {
     const blob = await res.blob();
     addResult({
       url: URL.createObjectURL(blob),
-      llm: $("llm").value, flow: $("flow").value, hift: $("hift").value,
-      text, elapsed: ((performance.now() - started) / 1000).toFixed(1),
+      // 優先用伺服器回報的，那才是實際用的；沒有就退回送出前的快照
+      ...parseVariant(res.headers.get("X-Variant"), snap),
+      text: snap.text,
+      elapsed: ((performance.now() - started) / 1000).toFixed(1),
       duration: res.headers.get("X-Duration-Sec"),
       seed: res.headers.get("X-Seed"),
-      prompt: file ? file.name : $("prompt_name").value,
-      uploaded: !!file,
+      prompt: decodeURIComponent(res.headers.get("X-Prompt-Name") || "") || snap.prompt,
+      uploaded: snap.uploaded,
       simplify: res.headers.get("X-Simplify") || "none;0",
       annotate: decodeURIComponent(res.headers.get("X-Annotate") || "none"),
       annotatedText: decodeURIComponent(res.headers.get("X-Annotated-Text") || ""),
@@ -492,6 +504,16 @@ function wireVote(el, r) {
       blame.hidden = true;
     }
   });
+}
+
+// X-Variant 長這樣：llm=llm_v7_best;flow=official;hift=official
+function parseVariant(v, fallback) {
+  const out = { llm: fallback.llm, flow: fallback.flow, hift: fallback.hift };
+  for (const kv of (v || "").split(";")) {
+    const [k, val] = kv.split("=");
+    if (k in out && val) out[k] = val;
+  }
+  return out;
 }
 
 function escapeHtml(s) {
