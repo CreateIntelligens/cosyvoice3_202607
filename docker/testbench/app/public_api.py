@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import json
 import os
 import secrets
 import threading
@@ -36,90 +37,49 @@ from pydantic import BaseModel, Field
 
 # ---------------------------------------------------------------- 音色
 
-# `gender` 只能是 male / female / unknown，而且值必須正確：CastAgent 直接拿它
-# 當 dict key 分池（`voice_pools`），填錯不會報錯，會安靜地把男角配到女聲。
+# /v1 對外提供哪些音色，定義在 gitignore 的資料檔裡，不在程式碼。
 #
-# 這十個的性別都是人耳確認過的。自動判斷不可靠：先用基頻分，149 Hz 那個被判成
-# 男聲，實際是低音女聲；門檻只好壓到 135 Hz。而且分音者會把同一個演員拆成多個
-# ID（1139/1113/1570 三個 ID 是同一人，說話人 embedding 相似度 0.87–0.89），
-# 光看 ID 會挑到重複的音色。最終這十位兩兩相似度最高 0.489，確認是不同人。
+# 兩個理由。一是**部署相關**：換一台機器，prompts/ 底下的音檔就不一樣，寫死在
+# 程式裡等於假設所有機器長一樣。二是**授權**：音色來自哪個錄音、能不能對外用，
+# 是每個部署自己的事——先前這裡寫死了九個八點檔抽出來的音色，那些沒有授權，
+# 一旦有人 clone 下來跑起來就直接對外露出去了。
 #
-# desc 裡「低沉／明亮」「平穩／起伏大」「語速」是量出來的（librosa pyin 的中位
-# 基頻與半音標準差）；主觀的年齡感與個性沒有寫，因為那要聽了才知道。
-VOICES: list[dict] = [
-    # ---- 男聲 5 ----
-    {
-        "voice_id": "taigi-male-01",
-        "prompt": "holdout_male_drama1_680.wav",
-        "label": "男聲 01（臺灣台語）",
-        "gender": "male",
-        "desc": "中低音 110 Hz，抑揚明顯，語速偏慢。八點檔對白",
-    },
-    {
-        "voice_id": "taigi-male-02",
-        "prompt": "taigi_male_drama1_025.wav",
-        "label": "男聲 02（臺灣台語・低沉）",
-        "gender": "male",
-        "desc": "最低沉 78 Hz，抑揚大，語速慢。適合沉穩、年長的角色",
-    },
-    {
-        "voice_id": "taigi-male-03",
-        "prompt": "taigi_male_drama1_1127.wav",
-        "label": "男聲 03（臺灣台語）",
-        "gender": "male",
-        "desc": "低音 101 Hz，起伏中等，語速偏慢",
-    },
-    {
-        "voice_id": "taigi-male-04",
-        "prompt": "taigi_male_drama1_1139.wav",
-        "label": "男聲 04（臺灣台語・語速快）",
-        "gender": "male",
-        "desc": "中低音 115 Hz，平穩，語速偏快。適合旁白與敘事",
-    },
-    {
-        "voice_id": "taigi-male-05",
-        "prompt": "taigi_male_drama1_226.wav",
-        "label": "男聲 05（臺灣台語・偏高）",
-        "gender": "male",
-        "desc": "男聲中偏高的 136 Hz，平穩。適合年輕角色",
-    },
-    # ---- 女聲 5 ----
-    {
-        "voice_id": "taigi-female-01",
-        "prompt": "holdout_female_drama1_489.wav",
-        "label": "女聲 01（臺灣台語）",
-        "gender": "female",
-        "desc": "明亮 307 Hz，平穩，語速慢。八點檔對白",
-    },
-    {
-        "voice_id": "taigi-female-02",
-        "prompt": "holdout_female_drama2_011.wav",
-        "label": "女聲 02（臺灣台語・語速快）",
-        "gender": "female",
-        "desc": "253 Hz，平穩，語速快、停頓少。適合資訊播報",
-    },
-    {
-        "voice_id": "taigi-female-03",
-        "prompt": "seen_drama1_020.wav",
-        "label": "女聲 03（臺灣台語・低）",
-        "gender": "female",
-        "desc": "女聲中偏低的 212 Hz，平穩，語速中等",
-    },
-    {
-        "voice_id": "taigi-female-04",
-        "prompt": "taigi_female_drama1_090.wav",
-        "label": "女聲 04（臺灣台語）",
-        "gender": "female",
-        "desc": "明亮 269 Hz，起伏中等，語速偏快",
-    },
-    {
-        "voice_id": "taigi-female-05",
-        "prompt": "hayley_開場白.wav",
-        "label": "女聲 05（華語參考音）",
-        "gender": "female",
-        "desc": "明亮 297 Hz，起伏中等，語速偏快。參考音是華語錄製的跨語言音色",
-    },
-]
+# 所以種子是空的。沒有設定檔時 /v1 回報零個音色，那是安全的失敗——寧可不能用，
+# 也不要預設提供不該提供的東西。試聽台不受影響，它直接掃 prompts/ 目錄。
+#
+# 設定檔格式（TAIGI_DATA/voices.json）：
+#   [{"voice_id": "young-female-01", "prompt": "檔名.wav", "label": "顯示名稱",
+#     "gender": "male|female|unknown", "age": "child|teen|young|adult|senior|unknown",
+#     "desc": "說明"}]
+_BUILTIN_VOICES: list[dict] = []
+
+
+# 音色清單是**部署相關的資料**，不是程式邏輯——換一台機器，prompts/ 底下的音檔就
+# 不一樣。所以放在 gitignore 的資料目錄裡，程式只負責讀。
+#
+# 第一次啟動時用上面那份內建清單當種子寫出來，之後就以檔案為準。加音色是編輯
+# JSON，不是改程式；那些檔案是誰的聲音、有沒有授權，本來就不該進版控。
+VOICES_JSON = Path(os.environ.get("TAIGI_DATA", "/data/taigi")) / "voices.json"
+
+
+def _load_voices() -> list[dict]:
+    try:
+        rows = json.loads(VOICES_JSON.read_text(encoding="utf-8"))
+        if isinstance(rows, list) and rows:
+            return rows
+    except (OSError, ValueError):
+        pass
+    try:                                   # 第一次啟動：把內建清單寫成種子
+        VOICES_JSON.parent.mkdir(parents=True, exist_ok=True)
+        VOICES_JSON.write_text(
+            json.dumps(_BUILTIN_VOICES, ensure_ascii=False, indent=1), encoding="utf-8")
+    except OSError:
+        pass                               # 唯讀掛載就算了，用記憶體裡那份
+    return _BUILTIN_VOICES
+
+
+VOICES: list[dict] = _load_voices()
+
 
 # /v1 跟著試聽台跑：用「目前常駐在顯存的那一組」，而不是寫死一組。這是刻意的
 # 取捨——好處是在瀏覽器切一下 /v1 就跟著換，不必編 compose 重建容器，兩邊也不會
@@ -130,7 +90,9 @@ VOICES: list[dict] = [
 # 快取依據——快取有可能存到別人試聽時經過的模型。
 #
 # 下面這三個只是**還沒有任何模型載入時**的起始值。
-LLM = os.environ.get("TTS_API_LLM", "llm_v5_suisiann_best")
+# 預設值只在環境變數沒設時生效；正式的來源是 docker-compose 的 TTS_API_LLM。
+# 寫 official 是刻意的——猜一個 checkpoint 名字，換機器時它多半不存在。
+LLM = os.environ.get("TTS_API_LLM", "official")
 FLOW = os.environ.get("TTS_API_FLOW", "official")
 HIFT = os.environ.get("TTS_API_HIFT", "official")
 # 繁體字在 Qwen 的詞彙表裡沒有共用字形就退化成 UTF-8 位元組，模型從未把它們
@@ -165,6 +127,11 @@ class Voice(BaseModel):
     gender: Literal["male", "female", "unknown"] = Field(
         description="只會是這三個值之一。呼叫端常拿它直接分池，所以值必須正確。")
     desc: str = Field(description="這個音色的說明", examples=["八點檔男聲，中年、口條穩"])
+    age: Literal["child", "teen", "young", "adult", "senior", "unknown"] = Field(
+        default="unknown",
+        description=("年齡層。child 孩童／teen 少年少女／young 青年／adult 壯年／"
+                     "senior 年長。標 unknown 的是真人戲劇錄音，沒有可靠的年齡標註"
+                     "——不要猜，猜錯比不標更糟。"))
     language: str = Field(default="zh-TW", description="BCP-47 語言標籤")
     sample_url: str | None = Field(
         default=None,
@@ -178,7 +145,7 @@ class ModelInfo(BaseModel):
     `model_version` 是指紋，換模型會變，但看不出換成了誰。要確認「現在跑的到底是
     哪一版」得另外去查容器環境變數或日誌，那不該是使用者的事。
     """
-    llm: str = Field(description="語言模型 checkpoint", examples=["llm_v5_suisiann_best"])
+    llm: str = Field(description="語言模型 checkpoint", examples=["llm_v7_best"])
     flow: str = Field(description="flow matching checkpoint", examples=["official"])
     hift: str = Field(description="聲碼器 checkpoint", examples=["official"])
     simplify: str = Field(description="繁→簡字形轉換模式（伺服器端自動套用）",

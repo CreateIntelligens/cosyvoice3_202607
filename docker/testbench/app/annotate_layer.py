@@ -19,8 +19,12 @@ import os
 import re
 import sys
 import urllib.request
+from pathlib import Path
 
-sys.path.insert(0, "/opt/CosyVoice/tools")
+# 容器把 repo 掛在 /opt/CosyVoice，但本機直接跑時不是。用環境變數指，
+# 兩種情境都能用。
+REPO = Path(os.environ.get("COSYVOICE_ROOT", "/opt/CosyVoice"))
+sys.path.insert(0, str(REPO / "tools"))
 
 MODES = ("none", "corpus", "gemini", "hanji", "hanji_llm")
 _gemini_cache: dict[str, dict] = {}
@@ -62,7 +66,7 @@ def _kip_gloss() -> dict[str, str]:
     _gloss_cache = {}
     try:
         import csv
-        path = "/opt/CosyVoice/workspace/chhoetaigi/ChhoeTaigi_TaihoaSoanntengTuichiautian.csv"
+        path = REPO / "workspace/chhoetaigi/ChhoeTaigi_TaihoaSoanntengTuichiautian.csv"
         from taigi_annotate import add_tone_digits
         with open(path, encoding="utf-8") as f:
             for row in csv.DictReader(f):
@@ -104,7 +108,7 @@ def _multi_readings() -> dict:
     global _multi_cache
     if _multi_cache is None:
         try:
-            with open("/opt/CosyVoice/workspace/moe_sutian/multi_readings.json",
+            with open(REPO / "workspace/moe_sutian/multi_readings.json",
                       encoding="utf-8") as f:
                 _multi_cache = json.load(f)
         except Exception:
