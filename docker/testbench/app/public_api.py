@@ -34,6 +34,8 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 
+import annotate_layer  # noqa: E402  台文轉換，見 annotate_layer.py
+
 
 # ---------------------------------------------------------------- 音色
 
@@ -97,7 +99,21 @@ FLOW = os.environ.get("TTS_API_FLOW", "official")
 HIFT = os.environ.get("TTS_API_HIFT", "official")
 # 繁體字在 Qwen 的詞彙表裡沒有共用字形就退化成 UTF-8 位元組，模型從未把它們
 # 當成一個字。對外一律轉簡體字形（只換字形，不換詞彙），呼叫端看不到這一層。
-SIMPLIFY = os.environ.get("TTS_API_SIMPLIFY", "full")
+# 台文模式之後不能再繁簡轉換。繁簡轉換是為華語輸入設計的（避免罕見繁體字被拆成
+# 位元組），但台語漢字轉簡體會被換成讀音不同的華語字——「連紲」變「连绁」，
+# 紲 lian5-sua3 變成 绁 xiè，模型就唸成 lian5-sia。
+SIMPLIFY = os.environ.get("TTS_API_SIMPLIFY", "none")
+
+# 華語詞 → 台語漢字。預設開，用 v5（對齊法）那份底表。
+#
+# 這是伺服器的決定，不做成請求參數——跟「不讓呼叫端選模型」同一個道理。聽測下來
+# v7＋台文查表最好，那就給呼叫端那個；它不該需要知道有幾張表、差在哪。
+# 換設定改環境變數重啟即可，model_version 會跟著變，呼叫端的快取自動失效。
+#
+# 不接 Gemini：整句都查得到時它不會被呼叫，但查不到時它會編出不存在的詞
+# （實測「鄰近→體近」「氣象署→天氣署」）。對外服務寧可少改，不要改錯。
+ANNOTATE = os.environ.get("TTS_API_ANNOTATE", "hanji")
+HANJI_TABLE = os.environ.get("TTS_API_HANJI_TABLE", "v5")
 
 # 合成是序列化的，所以請求會排隊。原本上限 45 秒是照短句校準的（當時一句 3–8
 # 秒），但長文一段就要兩分鐘以上——排在後面的請求還沒輪到就被拒絕，而它只要再
@@ -148,6 +164,10 @@ class ModelInfo(BaseModel):
     llm: str = Field(description="語言模型 checkpoint", examples=["llm_v7_best"])
     flow: str = Field(description="flow matching checkpoint", examples=["official"])
     hift: str = Field(description="聲碼器 checkpoint", examples=["official"])
+    annotate: str = Field(default="none",
+                          description="華語→台語漢字的轉換模式（伺服器端自動套用）",
+                          examples=["hanji"])
+    hanji_table: str = Field(default="", description="台文對照表版本", examples=["v5"])
     simplify: str = Field(description="繁→簡字形轉換模式（伺服器端自動套用）",
                           examples=["full"])
 
@@ -234,7 +254,8 @@ def create_router(
     def _model_info() -> ModelInfo:
         # Pydantic 的 BaseModel 不收位置參數，要逐個具名。
         llm, flow, hift = current_model()
-        return ModelInfo(llm=llm, flow=flow, hift=hift, simplify=SIMPLIFY)
+        return ModelInfo(llm=llm, flow=flow, hift=hift, simplify=SIMPLIFY,
+                         annotate=ANNOTATE, hanji_table=HANJI_TABLE)
 
     def model_version() -> str:
         """由當下常駐的 checkpoint 檔案算出，換檔或換模型都會變。"""
@@ -351,7 +372,9 @@ def create_router(
                            f"找不到語音 {req.voice_id}。可用的有："
                            f"{', '.join(available) or '（無）'}")
 
-        spoken, _swapped = to_simplified(text, SIMPLIFY)
+        spoken, annotate_note, _changed = annotate_layer.apply(
+            text, ANNOTATE, HANJI_TABLE or None)
+        spoken, _swapped = to_simplified(spoken, SIMPLIFY)
 
         with stats["lock"]:
             stats["queued"] += 1
@@ -406,9 +429,21 @@ def create_router(
                 # 例：馀、佮、刣）。不編碼的話，一旦文字裡真的有碎片字就整個
                 # 請求 500——先前測試的句子剛好都沒有，所以沒被發現。
                 "X-Unfixable": quote(remaining_fragments(spoken)),
-                "Access-Control-Expose-Headers":
-                    "X-Model-Version, X-Model-Llm, X-Seed, X-Duration-Sec, "
-                    "X-Render-Sec, X-Unfixable",
+                # 呼叫端不選這些，但要看得到伺服器做了什麼決定。出問題時能指出
+                # 是哪個環節，不必來問；重現時也知道要對齊哪些條件。
+                "X-Annotate": quote(annotate_note),
+                "X-Hanji-Table": HANJI_TABLE or "current",
+                "X-Simplify": SIMPLIFY,
+                "X-Speed": f"{req.speed}",
+                "X-Voice-Id": req.voice_id,
+                "X-Spoken-Text": quote(spoken[:900]),
+                # 沒列進來的 header 瀏覽器讀不到，前端會安靜地退回預設值。
+                # 加新 header 時這裡要一起加。
+                "Access-Control-Expose-Headers": ", ".join((
+                    "X-Model-Version", "X-Model-Llm", "X-Seed", "X-Duration-Sec",
+                    "X-Render-Sec", "X-Unfixable", "X-Annotate", "X-Hanji-Table",
+                    "X-Simplify", "X-Speed", "X-Voice-Id", "X-Spoken-Text",
+                )),
             },
         )
 

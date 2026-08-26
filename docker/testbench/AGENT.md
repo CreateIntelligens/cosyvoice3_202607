@@ -18,8 +18,31 @@ await tts.synthesize("你到底在哪裡？我找你很久了。", voice_id, pat
 模型訓練時看的就是華語書寫的文字,翻譯層只會讓句子偏離原意——先前用外部
 華語→台文 API 的做法就是這樣壞掉的,它會改寫整句。
 
-繁體簡體都收,字形轉換在伺服器端做,你不會看到,也不會有任何一個詞被換掉
-（只換字形,不換用詞）。
+繁體簡體都收。伺服器**會替你換詞**——這是刻意的，也是你不用做任何事的原因。
+
+## 伺服器對你的文字做了什麼
+
+華語詞跟台語詞常常不是同一個詞。模型自己做這件事不穩：「明天」它換得對，
+「東西」它會逐字唸成 tong1-se1 而不是物件。所以在送進模型之前先查表換掉：
+
+```
+你送的     明天早上九點，我們一起去市場買東西。
+實際合成   明仔載早起九點，咱做伙去市場買物件。
+```
+
+對照表有 1,240 個詞，是從 107,231 句「華語／台語」對照語料統計對齊出來的
+（兩邊斷詞，算 Dice 共現強度）。**查不到的詞原字留著**——那是安全的失敗，
+等同伺服器沒動它。
+
+你不需要、也不能選要不要換。這跟不讓你選模型是同一個道理：哪種處理比較好是
+聽出來的，那個判斷屬於伺服器。每次回應都會告訴你它做了什麼：
+
+```
+x-annotate      hanji[v5]:換了5詞，1詞查無
+x-spoken-text   明仔載早起九點，咱做伙去市場買物件。
+```
+
+覺得換錯了就把這兩個標頭貼給維運的人，不必自己猜。
 
 ---
 
@@ -180,11 +203,25 @@ key = hashlib.md5(f"{model_version}|{voice_id}|{text}".encode()).hexdigest()
 
 ```
 X-Model-Version   算快取用
+X-Model-Llm       實際掛的 checkpoint
 X-Seed            這次用的種子。要重現同一段音檔就把它放進請求的 seed
 X-Duration-Sec    音檔長度
 X-Render-Sec      合成花的時間
 X-Unfixable       仍會念錯的字
+
+X-Annotate        伺服器換了幾個詞    hanji[v5]:換了5詞，1詞查無
+X-Spoken-Text     實際送進模型的文字  明仔載早起九點，咱做伙去市場買物件。
+X-Hanji-Table     用了哪張對照表      v5
+X-Simplify        繁簡轉換模式        none
+X-Speed           語速                1.0
+X-Voice-Id        音色                young-male-01
 ```
+
+中文的那幾個是 URL 編碼的（HTTP 標頭只能放 latin-1），讀之前要 `unquote`。
+
+要重現一段音檔，需要對齊的是：**同一個 `X-Model-Version` + `X-Seed` +
+`X-Voice-Id` + `X-Speed`**。`X-Spoken-Text` 則是查問題用的——聽起來不對時，
+先看那一行是不是你以為的內容，多半在那裡就能分辨是換詞換錯還是模型唸錯。
 
 `X-Unfixable` 值得記進 log。那是台文專用字（佮、刣、囡），簡體也沒有對應字形，
 模型看到的是位元組碎片。累積下來就知道哪些字需要補資料。
@@ -294,7 +331,8 @@ curl $TTS_BASE_URL/v1/health     # 不需要 token
   "status": "ok",
   "model_version": "taigi-2026.08-c0b2231f",
   "model": {"llm": "llm_v7_best", "flow": "official",
-            "hift": "official", "simplify": "full"},
+            "hift": "official", "annotate": "hanji",
+            "hanji_table": "v5", "simplify": "none"},
   "cuda": true,
   "detail": null
 }

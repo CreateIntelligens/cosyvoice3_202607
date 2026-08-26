@@ -84,3 +84,4 @@ docker/testbench/eval/
 docker/testbench/.env
 workspace/chhoetaigi/lexicon.json
 workspace/moe_sutian/taigi_words.json
+docker/testbench/compose.log

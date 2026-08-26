@@ -125,7 +125,8 @@ curl http://10.9.0.35:50010/v1/health
 {
   "status": "ok",
   "model_version": "taigi-2026.08-c0b2231f",
-  "model": {"llm": "llm_v7_best", "flow": "official",
+  "model": {"llm": "llm_v7_best", "flow": "official", "annotate": "hanji",
+            "hanji_table": "v5",
             "hift": "official", "simplify": "full"},
   "cuda": true,
   "detail": null
@@ -194,7 +195,9 @@ checkpoint。合成的回應也帶 `X-Model-Llm`，所以拿到一個音檔之�
 | `TTS_API_KEY` | 無 | **必設**，否則 `/v1` 停用 |
 | `TTS_API_LLM` | `llm_v7_best` | 掛哪個 LLM checkpoint |
 | `TTS_API_FLOW` / `TTS_API_HIFT` | `official` | 這兩個微調過沒有比較好 |
-| `TTS_API_SIMPLIFY` | `full` | 繁→簡字形轉換，只換字形不換用詞 |
+| `TTS_API_ANNOTATE` | `hanji` | 華語詞→台語漢字。`none` 關閉；`hanji_llm` 讓 LLM 補查不到的詞（會編造，不建議對外用）|
+| `TTS_API_HANJI_TABLE` | `v5` | 對照表版本。`v5` 對齊法 1,240 詞（精確 64%）；`v1` 辭典法 23,486 詞（精確 42%）|
+| `TTS_API_SIMPLIFY` | `none` | 繁→簡字形轉換。**台文模式下必須關**——台語漢字轉簡體會變成讀音不同的華語字（連紲→连绁，lian5-sua3 變成 xiè）|
 | `TTS_API_MAX_WAIT_SEC` | `600` | 排隊超過就回 429。呼叫端的 timeout 要比它大 |
 | `TTS_API_MAX_TEXT_CHARS` | `5000` | 文字上限 |
 | `TTS_API_CHUNK_CHARS` | `80` | 每段字數，長文照這個切 |
