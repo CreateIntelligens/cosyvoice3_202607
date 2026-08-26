@@ -21,6 +21,7 @@ import io
 import json
 import os
 import secrets
+import sys
 import threading
 import time
 from pathlib import Path
@@ -258,7 +259,15 @@ def create_router(
                          annotate=ANNOTATE, hanji_table=HANJI_TABLE)
 
     def model_version() -> str:
-        """由當下常駐的 checkpoint 檔案算出，換檔或換模型都會變。"""
+        """凡是會改變輸出的東西都要算進來，否則呼叫端的快取不會失效。
+
+        先前只算 checkpoint。但同一個模型配不同的文字處理會生出不同的音檔——
+        改 TTS_API_ANNOTATE、換對照表版本、或有人在 /dicts 加一筆人工修正，
+        輸出就變了，而 model_version 不動的話呼叫端會繼續用舊音檔。
+
+        對照表用檔案的大小與 mtime，不讀內容——每個請求都要算，而那三層加起來
+        上萬筆。大小或時間變了就代表有人動過，這對「要不要失效快取」夠用了。
+        """
         h = hashlib.sha256()
         for part, name in zip(("llm", "flow", "hift"), current_model()):
             h.update(f"{part}={name};".encode())
@@ -266,6 +275,20 @@ def create_router(
             if path is not None and path.exists():
                 stat = path.stat()
                 h.update(f"{stat.st_size}:{int(stat.st_mtime)};".encode())
+        h.update(f"annotate={ANNOTATE};table={HANJI_TABLE};simplify={SIMPLIFY};".encode())
+        try:
+            sys.path.insert(0, os.path.join(
+                os.environ.get("COSYVOICE_ROOT", "/opt/CosyVoice"), "tools"))
+            import taigi_store
+            for f in (taigi_store.BASES.get(HANJI_TABLE) or taigi_store.BASE,
+                      taigi_store.LLM, taigi_store.OVERRIDES):
+                try:
+                    st = f.stat()
+                    h.update(f"{f.name}:{st.st_size}:{int(st.st_mtime)};".encode())
+                except OSError:
+                    h.update(f"{f.name}:absent;".encode())
+        except Exception:
+            pass                    # 查不到表就只用上面那些，指紋仍然可用
         return f"taigi-2026.08-{h.hexdigest()[:8]}"
 
     def require_token(cred: HTTPAuthorizationCredentials | None = Depends(bearer)) -> None:
