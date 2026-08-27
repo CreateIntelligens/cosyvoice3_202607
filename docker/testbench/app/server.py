@@ -378,19 +378,45 @@ VLLM_EAGER = os.environ.get("VLLM_EAGER", "0") not in ("0", "", "false", "False"
 # 每次不同，那變異就不在 RNG 而在 kernel 的數值，補 seed 是補不到的。
 VLLM_GREEDY = os.environ.get("VLLM_GREEDY", "0") not in ("0", "", "false", "False")
 
+# vLLM 的 KV 池佔顯存的比例。上游寫死 0.2，留空就沿用。設了就覆蓋——
+# 理由見 _patch_engine_args 的說明：那裡有一百倍的餘裕，讓給 TRT 比較划算。
+VLLM_GPU_FRACTION = float(os.environ.get("VLLM_GPU_FRACTION", "0") or 0) or None
 
-def _pin_vllm_eager(vllm) -> None:
-    """讓 EngineArgs 帶上 enforce_eager，同樣不動上游檔案。"""
-    if not VLLM_EAGER or getattr(vllm.EngineArgs, "_taigi_wrapped", False):
+# 一條序列最長幾個 token。上游沿用 Qwen 的 32768，但 CosyVoice 的序列短得多：
+# max_len = (文字長度 - prompt 長度) x max_token_text_ratio，80 字上限也才 1600。
+#
+# 這個值不只是上限，vLLM 會拿它檢查「KV 池至少要放得下一整條最長序列」。
+# 32768 配上調低的 gpu_memory_utilization 就會直接拒絕啟動——它建議調高記憶體，
+# 但正確的做法是把這個不切實際的長度改成實際會用到的。
+VLLM_MAX_LEN = int(os.environ.get("VLLM_MAX_LEN", "0") or 0) or None
+
+
+def _patch_engine_args(vllm) -> None:
+    """調整 vLLM 的引擎參數，不動上游檔案。
+
+    cosyvoice/cli/model.py 把 gpu_memory_utilization 寫死成 0.2。實測那是浪費：
+    KV 池子拿到 2.06 GiB，一個 token 佔 12 KiB，等於放得下 18 萬個 token；而
+    一發 7.5 秒的請求只用約 308 個，同時放得下 585 發。實際的併發天花板是 4，
+    卡在 flow 與聲碼器的算力，六發併發期間 preemption 是 0 次。
+
+    也就是說這 2 GiB 有一百倍的餘裕。把它讓出來給 TensorRT 的第二個執行上下文，
+    flow 那段才有機會真的並行——那才是現在擋住併發的地方。
+    """
+    if getattr(vllm.EngineArgs, "_taigi_wrapped", False):
         return
     original = vllm.EngineArgs
 
-    def eager(*args, **kwargs):
-        kwargs.setdefault("enforce_eager", True)
+    def patched(*args, **kwargs):
+        if VLLM_EAGER:
+            kwargs.setdefault("enforce_eager", True)
+        if VLLM_GPU_FRACTION:
+            kwargs["gpu_memory_utilization"] = VLLM_GPU_FRACTION
+        if VLLM_MAX_LEN:
+            kwargs["max_model_len"] = VLLM_MAX_LEN
         return original(*args, **kwargs)
 
-    eager._taigi_wrapped = True
-    vllm.EngineArgs = eager
+    patched._taigi_wrapped = True
+    vllm.EngineArgs = patched
 
 
 def _pin_vllm_seed() -> None:
@@ -414,7 +440,7 @@ def _pin_vllm_seed() -> None:
         import vllm
     except ImportError:
         return                                  # 沒開 vLLM，torch 的 seed 本來就管用
-    _pin_vllm_eager(vllm)
+    _patch_engine_args(vllm)
     if getattr(vllm.SamplingParams, "_taigi_wrapped", False):
         return
     original = vllm.SamplingParams
@@ -485,6 +511,7 @@ def build_variant_dir(llm: str, flow: str, hift: str) -> Path:
     # 等於每換一次模型就重跑一次匯出，而試聽台的用途就是一直換。已經備好的就沿用。
     if target.exists():
         if LOAD_VLLM and (target / "vllm").is_dir():
+            _link_trt_artifacts(target, flow)   # 沿用的目錄也要接上 TRT 快取
             return target
         shutil.rmtree(target)
     target.mkdir(parents=True)
@@ -494,7 +521,35 @@ def build_variant_dir(llm: str, flow: str, hift: str) -> Path:
         (target / entry.name).symlink_to(entry)
     for part, name in zip(PARTS, (llm, flow, hift)):
         (target / f"{part}.pt").symlink_to(part_path(part, name))
+    _link_trt_artifacts(target, flow)
     return target
+
+
+# TRT 的 ONNX 與編譯好的引擎放這裡，而不是變體目錄裡面。上面那個 rmtree 是為了
+# 換模型時乾淨重建，它不知道自己順手刪掉的是要花十幾分鐘才生得出來的東西——
+# 這件事已經發生過一次，服務因此 500。
+#
+# 依 flow 的名字分開存：估計器的權重來自 flow.pt，換了 flow 就是另一個引擎。
+TRT_CACHE = WORK_DIR / "_trt"
+TRT_FILES = ("flow.decoder.estimator.fp32.onnx",
+             "flow.decoder.estimator.fp32.mygpu.plan")
+
+
+def _link_trt_artifacts(target: Path, flow: str) -> None:
+    """把變體目錄裡的 TRT 檔名指到快取。
+
+    引擎還沒編譯過的時候故意留下懸空連結：convert_onnx_to_trt 用 open(path,"wb")
+    寫檔，會跟著連結寫到快取那一端，下次就直接沿用。
+    """
+    if not LOAD_TRT:
+        return
+    cache = TRT_CACHE / flow
+    cache.mkdir(parents=True, exist_ok=True)
+    for name in TRT_FILES:
+        link = target / name
+        if link.is_symlink() or link.exists():
+            link.unlink()
+        link.symlink_to(cache / name)
 
 
 def get_model(llm: str, flow: str, hift: str):
