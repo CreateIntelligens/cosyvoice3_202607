@@ -37,6 +37,11 @@
          background:#232838; color:var(--muted); border:1px solid var(--line); }
   .tag.b { color:var(--accent); border-color:#33415c; }
   .tag.hot { color:var(--ok); border-color:#2d5548; background:#16241c; }
+  /* 跟試聽台一致：seed 標籤點一下就沿用 */
+  .tag.seed { cursor:pointer; color:var(--ok); border-color:#2d5548; }
+  .tag.seed:hover { background:#2d5548; color:#eafff8; }
+  button.ghost { background:transparent; color:var(--muted); border:1px solid var(--line);
+                 width:auto; padding:6px 12px; margin:0; font-weight:400; font-size:13px; }
   audio { width:100%; margin-top:8px; }
   .empty { color:var(--muted); text-align:center; padding:48px 20px; }
   .err { color:#ff8f8f; }
@@ -105,9 +110,13 @@
       </div>
       <div>
         <label>Seed（-1 隨機）</label>
-        <input type="number" id="seed" value="-1">
+        <div class="row">
+          <input type="number" id="seed" value="-1" step="1" min="-1" max="2147483647">
+          <button class="ghost" id="reroll" style="width:100%">隨機</button>
+        </div>
       </div>
     </div>
+    <div class="hint">結果卡片上的 seed 點一下就沿用，跟試聽台一樣。</div>
 
     <label class="chk" style="display:flex;align-items:center;gap:7px;margin-top:12px;cursor:pointer">
       <input type="checkbox" id="autoplay" checked style="width:auto;margin:0">
@@ -147,6 +156,20 @@ let meta = null;
   fill($("llm"), v.parts.llm, (v.startup || {}).llm || "official");
   fill($("prompt_name"), v.prompts, v.prompts[0]);
 })();
+
+// seed 的兩個操作跟試聽台一致：卡片上的 seed 點一下沿用，「隨機」按回 -1。
+// 用事件委派而不是逐張卡片綁——卡片是後來才產生的。
+$("results").addEventListener("click", e => {
+  const t = e.target.closest(".tag.seed");
+  if (!t) return;
+  $("seed").value = t.dataset.seed;
+  $("status").textContent = `已沿用 seed ${t.dataset.seed}`;
+});
+
+$("reroll").onclick = () => {
+  $("seed").value = "-1";
+  $("status").textContent = "下一次會用隨機 seed";
+};
 
 let inflight = null;      // 生成中的 AbortController
 
@@ -444,7 +467,8 @@ function finish(card, head, blobs, t0) {
     + `<span class="tag">全部 ${elapsed.toFixed(2)}s</span>`
     + `<span class="tag">音長 ${head.total_sec}s</span>`
     + `<span class="tag">${head.chunks} 塊</span>`
-    + `<span class="tag">seed ${head.seed}</span>`);
+    + `<span class="tag seed" data-seed="${head.seed}" `
+    + `title="點一下沿用這個 seed">seed ${head.seed}</span>`);
   // 把所有塊接成一個檔，右邊就能重複聽。
   //
   // 這裡原本是「留下第一塊的檔頭，其餘各砍 44 byte」。兩個地方都錯：
