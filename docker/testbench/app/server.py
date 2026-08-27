@@ -11,6 +11,7 @@ frees the previous one first.
 """
 from __future__ import annotations
 
+import contextlib
 import io
 import json
 import logging
@@ -268,9 +269,125 @@ app = FastAPI(
     ],
 )
 
-_lock = threading.Lock()
+CONCURRENCY = max(1, int(os.environ.get("TTS_CONCURRENCY", "2")))
+TRT_CONCURRENT = max(1, int(os.environ.get("TRT_CONCURRENT", "1")))
+
+
+class Gate:
+    """Admit several requests at once, but let some of them demand the GPU alone.
+
+    Everything under CosyVoice2Model is already built to be shared: session state
+    is keyed by uuid, the vLLM engine batches whatever requests are in flight, and
+    the TensorRT decoder hands out execution contexts from a pool. Serialising
+    calls was our own doing, not the model's.
+
+    What is not shareable is the seed. Flow matching draws its starting noise from
+    torch's *global* generator, so two runs overlapping in time interleave their
+    draws and neither reproduces what it would have produced alone. That is fine
+    when the caller asked for a random seed and only wants audio, and not fine on
+    a page whose whole purpose is comparing one seed against another. So a pinned
+    seed takes the gate exclusively; everything else shares up to `slots`.
+
+    Model swaps are exclusive for the obvious reason: the weights move underneath
+    anyone mid-inference.
+    """
+
+    def __init__(self, slots: int):
+        self.slots = slots
+        self._cv = threading.Condition()
+        self._shared = 0          # 目前共享名額用掉幾個
+        self._exclusive = False   # 有沒有人正在獨佔
+        self._waiting_ex = 0      # 等著獨佔的人數，用來擋住後來的共享請求
+
+    @contextlib.contextmanager
+    def hold(self, exclusive: bool):
+        with self._cv:
+            if exclusive:
+                self._waiting_ex += 1
+                # 等到場子完全清空
+                self._cv.wait_for(lambda: not self._exclusive and self._shared == 0)
+                self._waiting_ex -= 1
+                self._exclusive = True
+            else:
+                # 有人在等獨佔就先讓，否則長串的共享請求會把它餓死
+                self._cv.wait_for(
+                    lambda: not self._exclusive and not self._waiting_ex
+                    and self._shared < self.slots)
+                self._shared += 1
+        try:
+            yield
+        finally:
+            with self._cv:
+                if exclusive:
+                    self._exclusive = False
+                else:
+                    self._shared -= 1
+                self._cv.notify_all()
+
+
+_gate = Gate(CONCURRENCY)
+_lock = threading.Lock()          # 只保護模型切換，不再包住整段合成
 _loaded: tuple[str, str, str] | None = None
 _model = None
+
+
+_vllm_seed: int | None = None
+
+# 補上 seed 之後，同一個 seed 八次仍有兩次不同。剩下的來源不是 RNG：flow 的起始
+# 噪音是載入時就算好的常數（CausalConditionalCFM.rand_noise），所以變異全在 LLM
+# 採樣——bf16 kernel 加上 CUDA graph 重播，logits 末位會浮動，偶爾把 top-k 的
+# 選擇翻掉。enforce_eager 關掉 CUDA graph 換取穩定，代價是解碼變慢。
+# 用環境變數控制，預設關閉：多數時候要的是速度，比 seed 的時候才需要開。
+VLLM_EAGER = os.environ.get("VLLM_EAGER", "0") not in ("0", "", "false", "False")
+
+
+def _pin_vllm_eager(vllm) -> None:
+    """讓 EngineArgs 帶上 enforce_eager，同樣不動上游檔案。"""
+    if not VLLM_EAGER or getattr(vllm.EngineArgs, "_taigi_wrapped", False):
+        return
+    original = vllm.EngineArgs
+
+    def eager(*args, **kwargs):
+        kwargs.setdefault("enforce_eager", True)
+        return original(*args, **kwargs)
+
+    eager._taigi_wrapped = True
+    vllm.EngineArgs = eager
+
+
+def _pin_vllm_seed() -> None:
+    """Make torch's seed reach vLLM's sampler, which otherwise ignores it.
+
+    Without vLLM both stochastic steps draw from torch's global generator, so
+    torch.manual_seed pins the whole run. vLLM samples inside its own engine
+    instead, and cosyvoice/llm/llm.py builds its SamplingParams without a seed —
+    so the engine's generator just keeps advancing from request to request. The
+    symptom is quiet and easy to miss: the same seed still returns audio, still
+    returns the *right* audio, but a different take each time. Measured here as
+    three distinct outputs across six identical requests.
+
+    SamplingParams is imported inside inference_wrapper, so replacing the name on
+    the vllm module is enough and no upstream file has to be edited. Only pinned
+    seeds inject a value, and those hold the gate exclusively — hence a plain
+    global rather than anything thread-aware. Random-seed requests leave vLLM's
+    default alone, which is what makes them safe to overlap.
+    """
+    try:
+        import vllm
+    except ImportError:
+        return                                  # 沒開 vLLM，torch 的 seed 本來就管用
+    _pin_vllm_eager(vllm)
+    if getattr(vllm.SamplingParams, "_taigi_wrapped", False):
+        return
+    original = vllm.SamplingParams
+
+    def seeded(*args, **kwargs):
+        if _vllm_seed is not None and kwargs.get("seed") is None:
+            kwargs["seed"] = _vllm_seed
+        return original(*args, **kwargs)
+
+    seeded._taigi_wrapped = True
+    vllm.SamplingParams = seeded
 
 
 def apply_seed(seed: int) -> int:
@@ -280,17 +397,23 @@ def apply_seed(seed: int) -> int:
     LLM samples speech tokens with multinomial, and flow matching starts from
     torch.randn_like. Seeding both the CPU and CUDA generators is therefore
     enough to make a given (checkpoints, text, prompt, seed) reproduce exactly.
+    Under vLLM the LLM half needs _pin_vllm_seed() as well.
 
     The automatic seed comes from secrets rather than the random module, whose
     global state CausalConditionalCFM.__init__ resets with set_all_random_seed(0)
     on every model load. Drawing from it returned the same number each time a
     variant was swapped.
     """
+    global _vllm_seed
+    pinned = seed >= 0
     if seed < 0:
         seed = secrets.randbelow(MAX_SEED)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+    if LOAD_VLLM:
+        _pin_vllm_seed()
+        _vllm_seed = seed if pinned else None
     return seed
 
 
@@ -341,8 +464,15 @@ def get_model(llm: str, flow: str, hift: str):
         torch.cuda.empty_cache()
     variant_dir = build_variant_dir(*combo)
     log.info("loading llm=%s flow=%s hift=%s", llm, flow, hift)
+    # trt_concurrent 是 TensorRT 執行上下文的池子大小。理想上要跟 TTS_CONCURRENCY
+    # 一樣多，flow 解碼才不會變成新的隊伍——但這張卡開不到 2：另一個服務佔著
+    # 5.3 GB，vLLM 又預留 0.2 的顯存，第二個上下文直接建不起來（common.py:206
+    # 的 assert）。留在 1 沒有正確性問題，池子的 queue.get() 會安全地排隊，
+    # 只是 flow 那一段仍然一次一個。顯存變寬裕再調這個環境變數。
+    if LOAD_VLLM:
+        _pin_vllm_seed()      # EngineArgs 在載入時就用到，補丁要趕在這之前
     _model = AutoModel(model_dir=str(variant_dir), load_vllm=LOAD_VLLM,
-                       load_trt=LOAD_TRT)
+                       load_trt=LOAD_TRT, trt_concurrent=TRT_CONCURRENT)
     _loaded = combo
     return _model
 
@@ -368,18 +498,20 @@ def render_stream(
     一邊送進 flow，湊夠一個 hop 就吐一塊。代價是每塊之間要重疊處理，總時間
     比一次做完略長；換到的是**第一個音出來的時間**大幅縮短。
 
-    鎖跟 render() 共用：同一時間只有一個請求在用 GPU。串流不改變這件事，
-    只是把「等全部」變成「等第一塊」。
+    併發規則跟 render() 一樣走 _gate。串流會把閘佔得比較久（要等整段送完），
+    所以指定 seed 的串流請求會明顯擋住別人——這是重現性的代價，不是 bug。
     """
     t0 = time.perf_counter()
-    with _lock:
-        if llm is None or flow is None or hift is None:
-            resident = _loaded or startup_model()
-            llm = llm if llm is not None else resident[0]
-            flow = flow if flow is not None else resident[1]
-            hift = hift if hift is not None else resident[2]
-        model = get_model(llm, flow, hift)
-        used_seed = apply_seed(seed)
+    exclusive = seed >= 0
+    with _gate.hold(exclusive):
+        with _lock:
+            if llm is None or flow is None or hift is None:
+                resident = _loaded or startup_model()
+                llm = llm if llm is not None else resident[0]
+                flow = flow if flow is not None else resident[1]
+                hift = hift if hift is not None else resident[2]
+            model = get_model(llm, flow, hift)
+            used_seed = apply_seed(seed)
         segments = split_for_synthesis(text, max_chunk_chars, comma_split)
         log.info("stream seed=%d llm=%s prompt=%s 段數=%d text=%r",
                  used_seed, llm, source.name, len(segments), text[:60])
@@ -481,18 +613,19 @@ def render(
     lock: read it outside and a switch between the read and the synthesis would
     have us report one model while using another.
 
-    Holds the GPU lock for the whole call: the three modules together need several
-    GB and this card is shared, so two concurrent syntheses would fight over VRAM
-    rather than overlap usefully.
+    併發由 _gate 管：指定 seed 的獨佔（見 Gate 的說明），其餘共享名額。
+    模型切換另外用 _lock 保護，因為權重會在別人推論到一半時被換掉。
     """
-    with _lock:
-        if llm is None or flow is None or hift is None:
-            resident = _loaded or startup_model()
-            llm = llm if llm is not None else resident[0]
-            flow = flow if flow is not None else resident[1]
-            hift = hift if hift is not None else resident[2]
-        model = get_model(llm, flow, hift)
-        used_seed = apply_seed(seed)
+    exclusive = seed >= 0
+    with _gate.hold(exclusive):
+        with _lock:
+            if llm is None or flow is None or hift is None:
+                resident = _loaded or startup_model()
+                llm = llm if llm is not None else resident[0]
+                flow = flow if flow is not None else resident[1]
+                hift = hift if hift is not None else resident[2]
+            model = get_model(llm, flow, hift)
+            used_seed = apply_seed(seed)
         # 種子只設一次，之後 RNG 自然往下走——與上游逐段合成的行為一致。
         segments = split_for_synthesis(text, max_chunk_chars, comma_split)
         log.info(

@@ -53,6 +53,20 @@
   .chunk .idx { width:34px; flex:none; }
   .chunk .at { width:62px; flex:none; color:var(--ink); }
   .live { color:var(--warn); font-size:12px; }
+  /* 串流的聲音沒有 <audio> 可以按，控制項得自己給一個 */
+  #bar { position:fixed; left:0; right:0; bottom:0; display:none; align-items:center; gap:12px;
+         padding:12px 20px; background:#161922; border-top:1px solid var(--line); z-index:9; }
+  #bar.on { display:flex; }
+  #bar button { width:38px; height:38px; flex:none; margin:0; padding:0; border-radius:50%;
+                font-size:13px; line-height:1; }
+  #bar #bar_stop { background:#2a2f3d; color:var(--ink); }
+  #bar .meta { flex:1; min-width:0; }
+  #bar_name { font-size:12px; color:var(--muted); white-space:nowrap;
+              overflow:hidden; text-overflow:ellipsis; margin-bottom:5px; }
+  #bar .track { height:4px; background:#2a2f3d; border-radius:2px; overflow:hidden; }
+  #bar_fill { height:100%; width:0; background:var(--ok); transition:width .1s linear; }
+  #bar_time { font-size:12px; color:var(--muted); font-variant-numeric:tabular-nums; flex:none; }
+  main { padding-bottom:80px; }
   .spoken { margin-top:8px; font-size:12px; color:var(--muted); padding:8px 11px;
             background:#0e1016; border:1px solid var(--line); border-radius:7px; }
 </style>
@@ -97,7 +111,7 @@
 
     <label class="chk" style="display:flex;align-items:center;gap:7px;margin-top:12px;cursor:pointer">
       <input type="checkbox" id="autoplay" checked style="width:auto;margin:0">
-      <span style="font-size:12px;color:var(--muted)">收到第一塊就開始播</span>
+      <span style="font-size:12px;color:var(--muted)">收到第一塊就開始播（無縫，下方可暫停）</span>
     </label>
 
     <button id="go">串流合成</button>
@@ -108,6 +122,16 @@
     <div id="results"><div class="empty">合成結果會留在這裡，可以重複聽</div></div>
   </section>
 </main>
+
+<div id="bar">
+  <button id="bar_play" title="暫停／繼續">❚❚</button>
+  <button id="bar_stop" title="停止">■</button>
+  <div class="meta">
+    <div id="bar_name"></div>
+    <div class="track"><div id="bar_fill"></div></div>
+  </div>
+  <div id="bar_time"></div>
+</div>
 
 <script>
 const $ = id => document.getElementById(id);
@@ -124,10 +148,14 @@ let meta = null;
   fill($("prompt_name"), v.prompts, v.prompts[0]);
 })();
 
+let inflight = null;      // 生成中的 AbortController
+
 $("go").onclick = async () => {
+  if (inflight) { inflight.abort(); return; }     // 生成中再按 = 中止
   const text = $("text").value.trim();
   if (!text) return;
-  $("go").disabled = true;
+  inflight = new AbortController();
+  $("go").textContent = "中止";
   $("status").textContent = "連線中…";
 
   const fd = new URLSearchParams({
@@ -141,26 +169,35 @@ $("go").onclick = async () => {
                  annotate: $("annotate").value };
   const card = newCard(snap);
   const t0 = performance.now();
+  // 這一批接管播放器；上一批（不管是串流還是卡片重聽）在這裡就停了
+  const session = $("autoplay").checked
+    ? player.begin(snap.text.slice(0, 40) + (snap.text.length > 40 ? "…" : "")) : 0;
 
   try {
-    const res = await fetch("/api/tts/stream", { method: "POST", body: fd });
+    const res = await fetch("/api/tts/stream",
+                            { method: "POST", body: fd, signal: inflight.signal });
     if (!res.ok) throw new Error((await res.json()).detail || res.statusText);
-    await consume(res.body.getReader(), card, t0);
+    await consume(res.body.getReader(), card, t0, session);
   } catch (e) {
-    card.status.innerHTML = `<span class="err">失敗：${e.message}</span>`;
-    $("status").innerHTML = `<span class="err">${e.message}</span>`;
+    const aborted = e.name === "AbortError";
+    card.live && card.live.remove();
+    card.status.innerHTML = aborted
+      ? `<span class="tag">已中止</span>` : `<span class="err">失敗：${esc(e.message)}</span>`;
+    if (!aborted) $("status").innerHTML = `<span class="err">${esc(e.message)}</span>`;
   }
-  $("go").disabled = false;
+  // 生成結束（或中止）後總長就定了，播放列才知道什麼時候該收起來
+  if (session === player.session) player.live = false;
+  inflight = null;
+  $("go").textContent = "串流合成";
   $("status").textContent = "";
 };
 
 // 串流格式是「一行 JSON + 一塊 WAV」重複。要邊收邊解析，所以自己管緩衝區，
 // 不能等 response 收完——那就失去串流的意義了。
-async function consume(reader, card, t0) {
+async function consume(reader, card, t0, session) {
   let buf = new Uint8Array(0);
   const blobs = [];
-  let playing = false;
-  const queue = [];
+  const player = new GaplessPlayer();
 
   const push = (u8) => {
     const n = new Uint8Array(buf.length + u8.length);
@@ -190,26 +227,132 @@ async function consume(reader, card, t0) {
       const blob = new Blob([wav], { type: "audio/wav" });
       blobs.push(blob);
       addChunk(card, head, blob);
-      if ($("autoplay").checked) {
-        queue.push(blob);
-        if (!playing) { playing = true; playQueue(queue).then(() => playing = false); }
-      }
+      if (session) player.push(session, wav.buffer.slice(wav.byteOffset, wav.byteOffset + wav.byteLength));
     }
     if (done) break;
   }
 }
 
-// 逐塊接著播。用一個 <audio> 依序放，比 Web Audio 拼接簡單，
-// 而且這頁的目的是「感受延遲」，不是無縫播放。
-async function playQueue(queue) {
-  const el = new Audio();
-  while (queue.length) {
-    const b = queue.shift();
-    el.src = URL.createObjectURL(b);
-    await el.play().catch(() => {});
-    await new Promise(r => { el.onended = r; el.onerror = r; });
+// 無縫播放：把每塊解碼成 AudioBuffer，用**絕對時間**排程，而不是等前一塊
+// 播完再放下一塊。<audio> 依序播的做法在每個接縫都會停一下——載入、解碼、
+// 起播各有延遲，加起來就是聽得出來的空隙。
+//
+// 排程的關鍵是 nextAt：第一塊決定起播時間（現在 + 一點緩衝），之後每塊接在
+// 前一塊結束的那一刻。只要生成追得上播放（RTF < 1，我們現在 0.5）就不會斷。
+//
+// 排程過的東西不會自己讓位：第二次生成若另開一個播放器，兩批音會疊著響，
+// 而且沒有東西叫得停。所以全頁只有這一個播放器，用 session 編號區分批次——
+// 換批就把舊的 source 全部 stop()，舊 session 再送來的塊直接丟掉。
+class GaplessPlayer {
+  constructor() {
+    this.ctx = null;
+    this.session = 0;
+    this.sources = [];
+    this.nextAt = 0;
+    this.startAt = 0;       // 這批的起播時刻（ctx 時間軸）
+    this.scheduled = 0;     // 已排程的總秒數
+    this.label = "";
+    this.chain = Promise.resolve();   // 解碼是非同步的，但排程順序必須照收到的順序
+    this.live = false;      // 還在串流中（總長還會增加）
   }
+  _ctx() {
+    if (!this.ctx) this.ctx = new (window.AudioContext || window.webkitAudioContext)();
+    return this.ctx;
+  }
+  // 開一批新的，回傳這批的號碼。舊的立刻停。
+  begin(label) {
+    this.stop();
+    pauseAllTags();               // 卡片上的 <audio> 也要讓位
+    this.session += 1;
+    this.label = label;
+    this.live = true;
+    this.startAt = 0;
+    this.scheduled = 0;
+    this._ctx();
+    bar.show(this);
+    return this.session;
+  }
+  push(session, arrayBuffer) {
+    if (session !== this.session) return;
+    this.chain = this.chain.then(async () => {
+      if (session !== this.session) return;
+      const ctx = this._ctx();
+      let audio;
+      try { audio = await ctx.decodeAudioData(arrayBuffer); }
+      catch (e) { return; }                       // 壞掉的塊跳過，不要卡住整條鏈
+      if (session !== this.session) return;       // 解碼期間被換掉了
+      const src = ctx.createBufferSource();
+      src.buffer = audio;
+      src.connect(ctx.destination);
+      // 落後了就從現在開始，不要排在過去——那會讓瀏覽器立刻播完，聽起來是爆音
+      const at = Math.max(this.nextAt, ctx.currentTime + 0.02);
+      src.start(at);
+      if (!this.startAt) this.startAt = at;
+      this.nextAt = at + audio.duration;
+      this.scheduled = this.nextAt - this.startAt;
+      this.sources.push(src);
+      src.onended = () => { this.sources = this.sources.filter(s => s !== src); };
+    });
+  }
+  stop() {
+    this.session += 1;                            // 讓在途的塊失效
+    for (const s of this.sources) { try { s.stop(); } catch (e) {} }
+    this.sources = [];
+    this.nextAt = 0; this.startAt = 0; this.scheduled = 0;
+    this.live = false;
+    if (this.ctx && this.ctx.state === "suspended") this.ctx.resume();
+    bar.hide();
+  }
+  // 暫停用 ctx.suspend()：時間軸整條凍住，所有排好的絕對時間仍然對得上，
+  // 恢復後接著走，不必重排。
+  async pause()  { if (this.ctx) { await this.ctx.suspend(); bar.sync(); } }
+  async resume() { if (this.ctx) { await this.ctx.resume();  bar.sync(); } }
+  get paused()  { return !!this.ctx && this.ctx.state === "suspended"; }
+  get elapsed() { return this.startAt ? Math.max(0, Math.min(this.ctx.currentTime - this.startAt, this.scheduled)) : 0; }
+  get playing() { return this.startAt > 0 && (this.live || this.elapsed < this.scheduled - 0.01); }
 }
+
+const player = new GaplessPlayer();
+
+// 卡片上的 <audio> 跟 Web Audio 是兩套輸出，誰都不知道對方在響，要手動互斥
+function pauseAllTags() {
+  document.querySelectorAll("#results audio").forEach(a => { if (!a.paused) a.pause(); });
+}
+document.addEventListener("play", e => {
+  if (e.target.tagName === "AUDIO") player.stop();
+}, true);
+
+// 底下那條播放列
+const bar = {
+  el: null, btn: null, name: null, time: null, fill: null, timer: null,
+  init() {
+    this.el = $("bar"); this.btn = $("bar_play"); this.name = $("bar_name");
+    this.time = $("bar_time"); this.fill = $("bar_fill");
+    this.btn.onclick = () => player.paused ? player.resume() : player.pause();
+    $("bar_stop").onclick = () => player.stop();
+  },
+  show(p) {
+    this.name.textContent = p.label;
+    this.el.classList.add("on");
+    clearInterval(this.timer);
+    this.timer = setInterval(() => this.sync(), 100);
+    this.sync();
+  },
+  hide() {
+    clearInterval(this.timer); this.timer = null;
+    if (this.el) this.el.classList.remove("on");
+  },
+  sync() {
+    if (!this.el) return;
+    const e = player.elapsed, t = player.scheduled;
+    this.time.textContent = `${e.toFixed(1)} / ${t.toFixed(1)}s${player.live ? " ·串流中" : ""}`;
+    this.fill.style.width = t ? `${Math.min(100, e / t * 100)}%` : "0%";
+    this.btn.textContent = player.paused ? "▶" : "❚❚";
+    // 播完了就收起來，但串流還沒結束的話要留著等下一塊
+    if (!player.live && t > 0 && e >= t - 0.01 && !player.paused) player.stop();
+  },
+};
+bar.init();
 
 function newCard(snap) {
   const empty = document.querySelector("#results .empty");
