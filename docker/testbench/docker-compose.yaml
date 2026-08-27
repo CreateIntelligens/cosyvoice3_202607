@@ -34,7 +34,17 @@ services:
       # 代價：每個 checkpoint 第一次載入要多花約 3 分鐘匯出權重，之後沿用
       # （匯出檔存在 testbench-variants 這個 volume，重啟不會消失）。
       LOAD_VLLM: "1"
-      LOAD_TRT: "1"
+      # 暫時關掉。TRT 引擎（.plan）跟它的來源 ONNX 都住在變體目錄裡，而
+      # get_model() 在 LOAD_VLLM 關掉時會 rmtree 整個目錄重建——兩個檔案一起
+      # 沒了，而且 base 模型裡沒有 ONNX 可以重生。
+      #
+      # 要復原：停掉服務（載入時要 VRAM，這張卡塞不下第二份模型），跑
+      #   python cosyvoice/bin/export_onnx.py --model_dir <變體目錄>
+      # 再把 LOAD_TRT 設回 1，第一次載入會花十幾分鐘編譯引擎。
+      #
+      # 但先量再說：關掉 TRT 之後同一句是 3.42s，開著的時候量到 3.84s——
+      # TRT 到底有沒有在幫忙，目前的數據並不支持。
+      LOAD_TRT: "0"
       # onnxruntime 靠這個才找得到 cuDNN 8。少了它 speaker embedding 會安靜地
       # 退回 CPU——不報錯，只是慢七倍，看起來像 vLLM 沒效果。
       LD_LIBRARY_PATH: /opt/cosyvoice-venv/lib/python3.10/site-packages/nvidia/cudnn/lib

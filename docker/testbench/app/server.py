@@ -150,6 +150,40 @@ LOAD_VLLM = os.environ.get("LOAD_VLLM", "0") not in ("0", "", "false", "False")
 # flow.decoder.estimator.fp32.onnx 在模型目錄裡，用 cosyvoice/bin/export_onnx.py 產生。
 LOAD_TRT = os.environ.get("LOAD_TRT", "0") not in ("0", "", "false", "False")
 
+# 同一個 seed 為什麼不是每次都一樣。量到的是純 torch 六次相同、vLLM 也是六次
+# 相同——**兩邊一樣**，所以不是 vLLM 造成的，這件事本來就在。
+#
+# 剩下的解釋是 cuDNN 會依實測時間挑卷積演算法、cuBLAS 的歸約順序不固定，
+# 加上 TF32。這些都讓同樣的輸入算出末位不同的結果，而 CFM 是迭代解 ODE，
+# 早期一點點差異會被放大成完全不同的一遍朗讀。
+#
+# 這組旗標把上面幾件事全部釘死，代價是速度。要嚴謹比 seed 時才開。
+# 注意 cuBLAS 那個要用環境變數，而且必須在第一次 CUDA 呼叫之前設好。
+# 分兩級是因為兩者的代價差很多，見下面的實測。
+#   1 / light —— 只釘 cuDNN 的演算法挑選與 TF32
+#   full      —— 再加 use_deterministic_algorithms，強迫每個運算都用決定性核心
+# 可以逗號組合，用來分辨是哪一項在收速度的錢：
+#   tf32   關掉 TF32，矩陣乘法走完整 fp32
+#   cudnn  cudnn.deterministic，強迫卷積用決定性演算法
+#   algo   use_deterministic_algorithms，範圍最廣
+#   full   等於 tf32,cudnn,algo
+DETERMINISTIC = os.environ.get("TTS_DETERMINISTIC", "0").lower()
+_det = set(DETERMINISTIC.replace("full", "tf32,cudnn,algo").split(","))
+if _det & {"tf32", "cudnn", "algo"}:
+    torch.backends.cudnn.benchmark = False
+    if "tf32" in _det:
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+    if "cudnn" in _det:
+        torch.backends.cudnn.deterministic = True
+    if "algo" in _det:
+        # 只有 use_deterministic_algorithms 需要這個，單開 cudnn 不必——把它綁在
+        # 一起會分不清速度是被誰吃掉的
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+        # warn_only：有些運算沒有決定性版本，寧可讓它跑完並警告，也不要整個掛掉
+        torch.use_deterministic_algorithms(True, warn_only=True)
+    log.info("決定性模式 %s 已啟用", sorted(_det & {"tf32", "cudnn", "algo"}))
+
 MAX_PROMPT_SEC = 30.0
 MIN_PROMPT_SEC = 1.0
 # CosyVoice3 tokenises this to id 151646 and asserts on its presence; without it the
@@ -340,6 +374,10 @@ _vllm_seed: int | None = None
 # 用環境變數控制，預設關閉：多數時候要的是速度，比 seed 的時候才需要開。
 VLLM_EAGER = os.environ.get("VLLM_EAGER", "0") not in ("0", "", "false", "False")
 
+# 診斷用：貪婪解碼（temperature=0）把採樣的隨機性整個拿掉。如果連貪婪都還會
+# 每次不同，那變異就不在 RNG 而在 kernel 的數值，補 seed 是補不到的。
+VLLM_GREEDY = os.environ.get("VLLM_GREEDY", "0") not in ("0", "", "false", "False")
+
 
 def _pin_vllm_eager(vllm) -> None:
     """讓 EngineArgs 帶上 enforce_eager，同樣不動上游檔案。"""
@@ -384,6 +422,8 @@ def _pin_vllm_seed() -> None:
     def seeded(*args, **kwargs):
         if _vllm_seed is not None and kwargs.get("seed") is None:
             kwargs["seed"] = _vllm_seed
+        if VLLM_GREEDY:
+            kwargs["temperature"] = 0.0
         return original(*args, **kwargs)
 
     seeded._taigi_wrapped = True
