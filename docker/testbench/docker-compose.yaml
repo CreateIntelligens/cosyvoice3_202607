@@ -6,7 +6,16 @@
 # so this one sits on 50010.
 services:
   testbench:
-    image: happy74527/cosyvoice3-taipei1:latest
+    # 以官方映像為基底加上 vLLM，見同目錄的 Dockerfile。
+    # 要退回舊行為：image 改成 happy74527/cosyvoice3-taipei1:latest（已標記為
+    # cosyvoice3-taipei1:rollback-pre-vllm），並拿掉 LOAD_VLLM。
+    # 以官方映像為基底加上 vLLM，見同目錄的 Dockerfile。
+    # 退回：image 改回 happy74527/cosyvoice3-taipei1:latest（已標記為
+    # cosyvoice3-taipei1:rollback-pre-vllm），LOAD_VLLM 設 0，然後 up -d。
+    image: cosyvoice3-taipei1-vllm:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
     container_name: cosyvoice3-testbench
     working_dir: /app
     command: python /app/server.py
@@ -21,6 +30,14 @@ services:
       # allocations as small as 12 MiB. Expandable segments let the allocator grow a
       # region instead of hunting for a contiguous free block.
       PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+      # vLLM 加速 LLM 那段。實測 RTF 1.35 → 0.39（LLM 10.33s → 2.01s）。
+      # 代價：每個 checkpoint 第一次載入要多花約 3 分鐘匯出權重，之後沿用
+      # （匯出檔存在 testbench-variants 這個 volume，重啟不會消失）。
+      LOAD_VLLM: "1"
+      LOAD_TRT: "1"
+      # onnxruntime 靠這個才找得到 cuDNN 8。少了它 speaker embedding 會安靜地
+      # 退回 CPU——不報錯，只是慢七倍，看起來像 vLLM 沒效果。
+      LD_LIBRARY_PATH: /opt/cosyvoice-venv/lib/python3.10/site-packages/nvidia/cudnn/lib
       # /v1 是給 agent 呼叫的介面。沒有這把 token 它一律回 503——寧可停用，
       # 也不要因為忘了設定就變成開放端點。放進 .env，不要寫進這個檔。
       TTS_API_KEY: ${TTS_API_KEY:-}

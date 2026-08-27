@@ -19,6 +19,7 @@ import secrets
 import shutil
 import sys
 import threading
+import time
 from typing import NamedTuple
 from pathlib import Path
 from urllib.parse import quote
@@ -134,6 +135,20 @@ COMMA_SPLIT = os.environ.get("COMMA_SPLIT", "0") not in ("0", "", "false", "Fals
 
 # frontend.py asserts this before extracting speech tokens; catching it here turns
 # an opaque 500 into something the caller can act on.
+# vLLM 加速 LLM 那一段。實測 RTF 從 1.35 降到 0.39（LLM 10.33s → 2.01s，快 5.1 倍）。
+#
+# 預設關閉，兩個原因：一是它要 torch 2.7 + vllm 0.9 的環境（見 docker/vllm-test），
+# 正式映像跑的是 torch 2.3.1；二是它第一次載入要多花約 3 分鐘匯出權重，而試聽台
+# 的用途是一直換模型比較——那個成本在對外服務上划算，在研究工具上不划算。
+LOAD_VLLM = os.environ.get("LOAD_VLLM", "0") not in ("0", "", "false", "False")
+
+# flow decoder 走 TensorRT。只開 vLLM 的話 LLM 快了 5 倍，但 flow 沒動——它的
+# 佔比就從 15% 變成 37%，變成新的瓶頸。社群拆解的數字也是聲碼器約 32%。
+#
+# 第一次要把 ONNX 編譯成 TRT 引擎（十幾分鐘），之後沿用。需要
+# flow.decoder.estimator.fp32.onnx 在模型目錄裡，用 cosyvoice/bin/export_onnx.py 產生。
+LOAD_TRT = os.environ.get("LOAD_TRT", "0") not in ("0", "", "false", "False")
+
 MAX_PROMPT_SEC = 30.0
 MIN_PROMPT_SEC = 1.0
 # CosyVoice3 tokenises this to id 151646 and asserts on its presence; without it the
@@ -298,7 +313,11 @@ def part_path(part: str, name: str) -> Path:
 def build_variant_dir(llm: str, flow: str, hift: str) -> Path:
     """Symlink the official model, then point the three .pt names at the picks."""
     target = WORK_DIR / f"{llm}__{flow}__{hift}"
+    # vLLM 會把權重匯出到 {model_dir}/vllm，那要花約 3 分鐘。每次都 rmtree 重建
+    # 等於每換一次模型就重跑一次匯出，而試聽台的用途就是一直換。已經備好的就沿用。
     if target.exists():
+        if LOAD_VLLM and (target / "vllm").is_dir():
+            return target
         shutil.rmtree(target)
     target.mkdir(parents=True)
     for entry in BASE_DIR.iterdir():
@@ -322,9 +341,56 @@ def get_model(llm: str, flow: str, hift: str):
         torch.cuda.empty_cache()
     variant_dir = build_variant_dir(*combo)
     log.info("loading llm=%s flow=%s hift=%s", llm, flow, hift)
-    _model = AutoModel(model_dir=str(variant_dir))
+    _model = AutoModel(model_dir=str(variant_dir), load_vllm=LOAD_VLLM,
+                       load_trt=LOAD_TRT)
     _loaded = combo
     return _model
+
+
+def render_stream(
+    text: str,
+    *,
+    llm: str | None,
+    flow: str | None,
+    hift: str | None,
+    instruct: str,
+    source: Path,
+    speed: float,
+    seed: int,
+    max_chunk_chars: int = MAX_CHUNK_CHARS,
+    comma_split: bool = COMMA_SPLIT,
+):
+    """逐塊產出音訊，而不是等整段合成完。
+
+    yield (音訊張量, 取樣率, 這是第幾塊, 從請求開始算的秒數)。
+
+    跟 render() 的差別只有 stream=True——模型內部改成一邊生 speech token
+    一邊送進 flow，湊夠一個 hop 就吐一塊。代價是每塊之間要重疊處理，總時間
+    比一次做完略長；換到的是**第一個音出來的時間**大幅縮短。
+
+    鎖跟 render() 共用：同一時間只有一個請求在用 GPU。串流不改變這件事，
+    只是把「等全部」變成「等第一塊」。
+    """
+    t0 = time.perf_counter()
+    with _lock:
+        if llm is None or flow is None or hift is None:
+            resident = _loaded or startup_model()
+            llm = llm if llm is not None else resident[0]
+            flow = flow if flow is not None else resident[1]
+            hift = hift if hift is not None else resident[2]
+        model = get_model(llm, flow, hift)
+        used_seed = apply_seed(seed)
+        segments = split_for_synthesis(text, max_chunk_chars, comma_split)
+        log.info("stream seed=%d llm=%s prompt=%s 段數=%d text=%r",
+                 used_seed, llm, source.name, len(segments), text[:60])
+        index = 0
+        for piece in segments:
+            for out in model.inference_instruct2(
+                    piece, instruct, str(source), stream=True,
+                    speed=speed, text_frontend=False):
+                index += 1
+                yield (out["tts_speech"], model.sample_rate, index,
+                       time.perf_counter() - t0, used_seed)
 
 
 @app.get("/api/variants")
@@ -790,6 +856,78 @@ def feedback(fb: Feedback):
     return {"ok": True}
 
 
+@app.post("/api/tts/stream")
+def tts_stream(
+    text: str = Form(...),
+    llm: str = Form(OFFICIAL),
+    flow: str = Form(OFFICIAL),
+    hift: str = Form(OFFICIAL),
+    instruct: str = Form(DEFAULT_INSTRUCT),
+    prompt_name: str = Form(""),
+    speed: float = Form(1.0),
+    simplify: str = Form("none"),
+    annotate: str = Form("none"),
+    hanji_table: str = Form(""),
+    max_chunk_chars: int = Form(MAX_CHUNK_CHARS),
+    seed: int = Form(-1),
+):
+    """串流合成。每塊音訊即時送出，不等整段做完。
+
+    格式是一行 JSON 後面接一塊 WAV，重複到結束：
+
+        {"chunk":1,"bytes":41036,"at":1.83,"sec":0.85}\n<wav bytes>
+        {"chunk":2,...}\n<wav bytes>
+        {"done":true,"chunks":9,"total_sec":17.16,"elapsed":12.4,"seed":7}\n
+
+    `at` 是從請求開始算到這塊送出的秒數——第一塊的 at 就是「多久聽得到聲音」，
+    那是串流唯一真正買到的東西（總時間反而會略長）。
+
+    用自訂格式而不是 multipart：呼叫端要邊收邊播，multipart 的解析器多半會
+    先把整份收完，那就失去意義了。
+    """
+    if not BASE_DIR.is_dir():
+        raise HTTPException(503, f"official model not found under {BASE_DIR}")
+    if annotate not in annotate_layer.MODES:
+        raise HTTPException(400, f"annotate must be one of {annotate_layer.MODES}")
+    source = PROMPTS_DIR / prompt_name
+    if not prompt_name or not source.is_file():
+        raise HTTPException(400, f"unknown prompt: {prompt_name!r}")
+
+    body, _note, _changed = annotate_layer.apply(text, annotate, hanji_table or None)
+    if not annotate.startswith("hanji"):
+        body, _ = to_simplified(body, simplify)
+
+    def gen():
+        try:
+            total = 0.0
+            last = (0, 0.0, seed)
+            for audio, sr, index, at, used_seed in render_stream(
+                    body, llm=llm, flow=flow, hift=hift, instruct=instruct,
+                    source=source, speed=speed, seed=seed,
+                    max_chunk_chars=max_chunk_chars):
+                buf = io.BytesIO()
+                torchaudio.save(buf, audio, sr, format="wav")
+                data = buf.getvalue()
+                sec = audio.shape[1] / sr
+                total += sec
+                last = (index, total, used_seed)
+                head = json.dumps({"chunk": index, "bytes": len(data),
+                                   "at": round(at, 3), "sec": round(sec, 3)},
+                                  ensure_ascii=False)
+                yield head.encode() + b"\n" + data
+            yield (json.dumps({"done": True, "chunks": last[0],
+                               "total_sec": round(last[1], 2),
+                               "seed": last[2], "spoken": body[:900]},
+                              ensure_ascii=False) + "\n").encode()
+        except Exception as exc:                      # 串流開始後才失敗的話，
+            log.exception("stream failed")            # HTTP 狀態碼已經送出去了，
+            yield (json.dumps({"error": str(exc)}) + "\n").encode()   # 只能寫進內容
+
+    return StreamingResponse(gen(), media_type="application/octet-stream",
+                             headers={"X-Variant": f"llm={llm};flow={flow};hift={hift}",
+                                      "Cache-Control": "no-store"})
+
+
 @app.get("/api/prompt/{name}")
 def prompt_audio(name: str):
     path = PROMPTS_DIR / name
@@ -828,6 +966,13 @@ if admin_api.ADMIN_KEY:
     app.include_router(admin_api.router)
 else:
     log.info("ADMIN_API_KEY 未設定，/admin 維護端點不掛載")
+
+@app.get("/stream", include_in_schema=False)
+def stream_page():
+    """/stream 是串流試聽頁。StaticFiles 只認 .html，補一條乾淨的路徑。"""
+    return FileResponse(STATIC_DIR / "stream.html",
+                        headers={"Cache-Control": "no-cache, must-revalidate"})
+
 
 @app.get("/dicts", include_in_schema=False)
 @app.get("/dicts/{version}", include_in_schema=False)

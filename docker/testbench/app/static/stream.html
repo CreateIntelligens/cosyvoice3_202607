@@ -1,0 +1,291 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>串流合成</title>
+<style>
+  :root {
+    --bg:#12141a; --panel:#1a1d26; --line:#2a2f3d; --ink:#e6e8ee;
+    --muted:#8b93a7; --accent:#6ea8fe; --ok:#4ec9a5; --warn:#e6a23c;
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink);
+         font:15px/1.6 system-ui,"Noto Sans TC",sans-serif; }
+  header { padding:20px 24px; border-bottom:1px solid var(--line); }
+  h1 { margin:0; font-size:19px; font-weight:600; }
+  .sub { color:var(--muted); font-size:13px; margin-top:4px; }
+  a { color:var(--accent); }
+  main { display:grid; grid-template-columns:400px 1fr; gap:20px; padding:20px 24px; align-items:start; }
+  @media (max-width:900px) { main { grid-template-columns:1fr; } }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:18px; }
+  label { display:block; font-size:12px; color:var(--muted); margin:14px 0 5px; }
+  label:first-child { margin-top:0; }
+  select, textarea, input { width:100%; background:#0e1016; color:var(--ink);
+    border:1px solid var(--line); border-radius:7px; padding:9px 10px; font:inherit; font-size:14px; }
+  textarea { resize:vertical; min-height:90px; }
+  button { background:var(--accent); color:#0b0d12; border:0; border-radius:7px;
+           padding:11px 16px; font:inherit; font-weight:600; cursor:pointer; width:100%; margin-top:18px; }
+  button:disabled { opacity:.5; cursor:default; }
+  .row { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+  .hint { font-size:12px; color:var(--muted); margin-top:6px; }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:10px;
+          padding:14px 16px; margin-bottom:12px; }
+  .card h3 { margin:0 0 6px; font-size:14px; font-weight:600; }
+  .tags { display:flex; flex-wrap:wrap; gap:6px; margin:8px 0; }
+  .tag { font-size:11px; padding:2px 8px; border-radius:20px;
+         background:#232838; color:var(--muted); border:1px solid var(--line); }
+  .tag.b { color:var(--accent); border-color:#33415c; }
+  .tag.hot { color:var(--ok); border-color:#2d5548; background:#16241c; }
+  audio { width:100%; margin-top:8px; }
+  .empty { color:var(--muted); text-align:center; padding:48px 20px; }
+  .err { color:#ff8f8f; }
+  /* 第一塊的到達時間是這頁的重點，給它一個大字 */
+  .ttfa { display:flex; align-items:baseline; gap:10px; margin:10px 0 4px; }
+  .ttfa b { font-size:30px; color:var(--ok); font-variant-numeric:tabular-nums; }
+  .ttfa span { font-size:12px; color:var(--muted); }
+  .ttfa.waiting b { color:var(--warn); }
+  /* 每一塊畫成一條，長度按音訊秒數，位置按抵達時間 */
+  .chunks { margin-top:10px; }
+  .chunk { display:flex; align-items:center; gap:8px; margin-bottom:3px; font-size:11px;
+           color:var(--muted); font-variant-numeric:tabular-nums; }
+  .chunk .bar { height:12px; background:#2d5548; border-radius:3px; flex:none; }
+  .chunk .idx { width:34px; flex:none; }
+  .chunk .at { width:62px; flex:none; color:var(--ink); }
+  .live { color:var(--warn); font-size:12px; }
+  .spoken { margin-top:8px; font-size:12px; color:var(--muted); padding:8px 11px;
+            background:#0e1016; border:1px solid var(--line); border-radius:7px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>串流合成</h1>
+  <div class="sub">
+    邊生成邊播，量「多久聽得到第一個音」。<a href="/">回試聽台</a>　<a href="/dicts">台文對照表</a>
+  </div>
+</header>
+
+<main>
+  <section class="panel">
+    <label>LLM</label>
+    <select id="llm"></select>
+
+    <label>音色</label>
+    <select id="prompt_name"></select>
+
+    <label>華語文字</label>
+    <textarea id="text">颱風將在今天晚上開始影響台灣東部海域，氣象專家提醒民眾注意安全，這次的降雨強度可能會超過去年同期的紀錄。</textarea>
+    <div class="hint">串流的價值在長文——短句還沒等到第二塊就做完了，看不出差別。</div>
+
+    <label>文字轉換</label>
+    <select id="annotate">
+      <option value="none" selected>不轉換</option>
+      <option value="hanji">轉台文（查表）</option>
+      <option value="hanji_llm">轉台文（查表＋Gemini）</option>
+    </select>
+
+    <div class="row">
+      <div>
+        <label>語速</label>
+        <input type="number" id="speed" value="1.0" step="0.05" min="0.5" max="2.0">
+      </div>
+      <div>
+        <label>Seed（-1 隨機）</label>
+        <input type="number" id="seed" value="-1">
+      </div>
+    </div>
+
+    <label class="chk" style="display:flex;align-items:center;gap:7px;margin-top:12px;cursor:pointer">
+      <input type="checkbox" id="autoplay" checked style="width:auto;margin:0">
+      <span style="font-size:12px;color:var(--muted)">收到第一塊就開始播</span>
+    </label>
+
+    <button id="go">串流合成</button>
+    <div class="hint" id="status"></div>
+  </section>
+
+  <section>
+    <div id="results"><div class="empty">合成結果會留在這裡，可以重複聽</div></div>
+  </section>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+let meta = null;
+
+(async () => {
+  const v = await (await fetch("/api/variants")).json();
+  meta = v;
+  const fill = (el, items, want) => {
+    el.innerHTML = items.map(x => `<option value="${x}">${x}</option>`).join("");
+    if (items.includes(want)) el.value = want;
+  };
+  fill($("llm"), v.parts.llm, (v.startup || {}).llm || "official");
+  fill($("prompt_name"), v.prompts, v.prompts[0]);
+})();
+
+$("go").onclick = async () => {
+  const text = $("text").value.trim();
+  if (!text) return;
+  $("go").disabled = true;
+  $("status").textContent = "連線中…";
+
+  const fd = new URLSearchParams({
+    text, llm: $("llm").value, flow: "official", hift: "official",
+    prompt_name: $("prompt_name").value, annotate: $("annotate").value,
+    simplify: "none", speed: $("speed").value, seed: $("seed").value || "-1",
+  });
+
+  // 送出前拍快照：合成期間使用者可能改選單，卡片要標「這段實際用的」
+  const snap = { text, llm: $("llm").value, prompt: $("prompt_name").value,
+                 annotate: $("annotate").value };
+  const card = newCard(snap);
+  const t0 = performance.now();
+
+  try {
+    const res = await fetch("/api/tts/stream", { method: "POST", body: fd });
+    if (!res.ok) throw new Error((await res.json()).detail || res.statusText);
+    await consume(res.body.getReader(), card, t0);
+  } catch (e) {
+    card.status.innerHTML = `<span class="err">失敗：${e.message}</span>`;
+    $("status").innerHTML = `<span class="err">${e.message}</span>`;
+  }
+  $("go").disabled = false;
+  $("status").textContent = "";
+};
+
+// 串流格式是「一行 JSON + 一塊 WAV」重複。要邊收邊解析，所以自己管緩衝區，
+// 不能等 response 收完——那就失去串流的意義了。
+async function consume(reader, card, t0) {
+  let buf = new Uint8Array(0);
+  const blobs = [];
+  let playing = false;
+  const queue = [];
+
+  const push = (u8) => {
+    const n = new Uint8Array(buf.length + u8.length);
+    n.set(buf); n.set(u8, buf.length); buf = n;
+  };
+  const nl = () => buf.indexOf(10);   // \n
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (value) push(value);
+    let progressed = true;
+    while (progressed) {
+      progressed = false;
+      const i = nl();
+      if (i < 0) break;
+      const head = JSON.parse(new TextDecoder().decode(buf.slice(0, i)));
+      if (head.done || head.error) {
+        buf = buf.slice(i + 1);
+        finish(card, head, blobs, t0);
+        return;
+      }
+      if (buf.length < i + 1 + head.bytes) break;      // WAV 還沒收齊
+      const wav = buf.slice(i + 1, i + 1 + head.bytes);
+      buf = buf.slice(i + 1 + head.bytes);
+      progressed = true;
+
+      const blob = new Blob([wav], { type: "audio/wav" });
+      blobs.push(blob);
+      addChunk(card, head, blob);
+      if ($("autoplay").checked) {
+        queue.push(blob);
+        if (!playing) { playing = true; playQueue(queue).then(() => playing = false); }
+      }
+    }
+    if (done) break;
+  }
+}
+
+// 逐塊接著播。用一個 <audio> 依序放，比 Web Audio 拼接簡單，
+// 而且這頁的目的是「感受延遲」，不是無縫播放。
+async function playQueue(queue) {
+  const el = new Audio();
+  while (queue.length) {
+    const b = queue.shift();
+    el.src = URL.createObjectURL(b);
+    await el.play().catch(() => {});
+    await new Promise(r => { el.onended = r; el.onerror = r; });
+  }
+}
+
+function newCard(snap) {
+  const empty = document.querySelector("#results .empty");
+  if (empty) empty.remove();
+  const el = document.createElement("div");
+  el.className = "card";
+  el.innerHTML = `
+    <h3>${esc(snap.text.slice(0, 60))}${snap.text.length > 60 ? "…" : ""}</h3>
+    <div class="tags">
+      <span class="tag b">llm: ${esc(snap.llm)}</span>
+      <span class="tag">音色: ${esc(snap.prompt)}</span>
+      ${snap.annotate !== "none" ? `<span class="tag">${esc(snap.annotate)}</span>` : ""}
+    </div>
+    <div class="ttfa waiting"><b>—</b><span>秒後聽到第一個音</span></div>
+    <div class="live">串流中…</div>
+    <div class="chunks"></div>
+    <div class="status"></div>`;
+  $("results").prepend(el);
+  return { el, ttfa: el.querySelector(".ttfa"), live: el.querySelector(".live"),
+           chunks: el.querySelector(".chunks"), status: el.querySelector(".status") };
+}
+
+function addChunk(card, head, blob) {
+  if (card.chunks.children.length === 0) {
+    card.ttfa.querySelector("b").textContent = head.at.toFixed(2);
+    card.ttfa.classList.remove("waiting");
+  }
+  const row = document.createElement("div");
+  row.className = "chunk";
+  row.innerHTML = `<span class="idx">#${head.chunk}</span>`
+    + `<span class="at">${head.at.toFixed(2)}s</span>`
+    + `<span class="bar" style="width:${Math.max(6, head.sec * 26)}px"></span>`
+    + `<span>${head.sec.toFixed(2)}s</span>`;
+  card.chunks.appendChild(row);
+}
+
+function finish(card, head, blobs, t0) {
+  card.live.remove();
+  if (head.error) {
+    card.status.innerHTML = `<span class="err">${esc(head.error)}</span>`;
+    return;
+  }
+  const elapsed = (performance.now() - t0) / 1000;
+  const ttfa = parseFloat(card.ttfa.querySelector("b").textContent) || 0;
+  card.el.querySelector(".tags").insertAdjacentHTML("beforeend",
+    `<span class="tag hot">第一個音 ${ttfa.toFixed(2)}s</span>`
+    + `<span class="tag">全部 ${elapsed.toFixed(2)}s</span>`
+    + `<span class="tag">音長 ${head.total_sec}s</span>`
+    + `<span class="tag">${head.chunks} 塊</span>`
+    + `<span class="tag">seed ${head.seed}</span>`);
+  // 把所有塊接成一個檔，右邊就能重複聽。WAV 各自有 44 byte 檔頭，
+  // 除了第一塊都要去掉，否則播放器會在接縫處停住。
+  (async () => {
+    const parts = [];
+    for (let i = 0; i < blobs.length; i++) {
+      const ab = await blobs[i].arrayBuffer();
+      parts.push(i === 0 ? ab : ab.slice(44));
+    }
+    const merged = new Blob(parts, { type: "audio/wav" });
+    const audio = document.createElement("audio");
+    audio.controls = true;
+    audio.src = URL.createObjectURL(merged);
+    card.el.appendChild(audio);
+    if (head.spoken) {
+      const d = document.createElement("div");
+      d.className = "spoken";
+      d.textContent = "送進模型：" + head.spoken;
+      card.el.appendChild(d);
+    }
+  })();
+}
+
+function esc(s) {
+  return String(s ?? "").replace(/[&<>"']/g,
+    c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+</script>
+</body>
+</html>
