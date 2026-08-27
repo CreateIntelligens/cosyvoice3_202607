@@ -197,12 +197,9 @@ $("go").onclick = async () => {
 async function consume(reader, card, t0, session) {
   let buf = new Uint8Array(0);
   const blobs = [];
-  const player = new GaplessPlayer();
-player.onError = (err) => {
-  $("status").innerHTML = `<span class="err">播放失敗：${esc(err.message || err)}</span>`;
-  console.error("[stream] 播放失敗", err);
-};
-
+  // 這裡曾經有一行 const player = new GaplessPlayer()，把全域那個遮住了。
+  // 症狀很難看出來：播放列照常出現（那是 begin() 對全域做的），但每一塊都被
+  // 推進這個區域的新播放器，session 對不上而被靜靜丟掉——畫面停在 0.0 / 0.0s。
   const push = (u8) => {
     const n = new Uint8Array(buf.length + u8.length);
     n.set(buf); n.set(u8, buf.length); buf = n;
