@@ -394,10 +394,15 @@ def apply_seed(seed: int) -> int:
     """Pin the RNG so a run can be repeated.
 
     Both stochastic steps in inference draw from torch's global generator: the
-    LLM samples speech tokens with multinomial, and flow matching starts from
-    torch.randn_like. Seeding both the CPU and CUDA generators is therefore
-    enough to make a given (checkpoints, text, prompt, seed) reproduce exactly.
-    Under vLLM the LLM half needs _pin_vllm_seed() as well.
+    LLM samples speech tokens with multinomial, so seeding both the CPU and CUDA
+    generators pins a given (checkpoints, text, prompt, seed). Under vLLM that
+    half needs _pin_vllm_seed() as well.
+
+    This used to claim flow matching contributes randomness too, via
+    torch.randn_like. It does not: CosyVoice3 uses CausalConditionalCFM, whose
+    __init__ precomputes self.rand_noise once under set_all_random_seed(0) and
+    slices the same block on every call. The seed has only ever controlled token
+    sampling — worth knowing when a run varies and the LLM looks innocent.
 
     The automatic seed comes from secrets rather than the random module, whose
     global state CausalConditionalCFM.__init__ resets with set_all_random_seed(0)
