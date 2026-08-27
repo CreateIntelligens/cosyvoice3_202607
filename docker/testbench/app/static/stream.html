@@ -198,6 +198,10 @@ async function consume(reader, card, t0, session) {
   let buf = new Uint8Array(0);
   const blobs = [];
   const player = new GaplessPlayer();
+player.onError = (err) => {
+  $("status").innerHTML = `<span class="err">播放失敗：${esc(err.message || err)}</span>`;
+  console.error("[stream] 播放失敗", err);
+};
 
   const push = (u8) => {
     const n = new Uint8Array(buf.length + u8.length);
@@ -266,9 +270,16 @@ class GaplessPlayer {
     this.session += 1;
     this.label = label;
     this.live = true;
+    this.userPaused = false;
     this.startAt = 0;
     this.scheduled = 0;
-    this._ctx();
+    // 鏈條要跟著重來。一個沒接住的例外會讓 promise 進入 rejected，之後每一個
+    // .then() 都被跳過——症狀是「這一頁從此再也不會播」，而且重按也沒用。
+    this.chain = Promise.resolve();
+    // 瀏覽器建出來的 AudioContext 是 suspended 的，要有使用者手勢才會動。這裡
+    // 正好在按鈕的 click 裡面，是唯一能可靠 resume 的時機。漏掉這一步的症狀
+    // 是「完全不動」：沒有聲音，而且 currentTime 停在 0，所以進度條也不會走。
+    this._ctx().resume().catch(() => {});
     bar.show(this);
     return this.session;
   }
@@ -277,9 +288,25 @@ class GaplessPlayer {
     this.chain = this.chain.then(async () => {
       if (session !== this.session) return;
       const ctx = this._ctx();
-      let audio;
-      try { audio = await ctx.decodeAudioData(arrayBuffer); }
-      catch (e) { return; }                       // 壞掉的塊跳過，不要卡住整條鏈
+      // 分頁切到背景、或自動播放政策擋下來，都會讓它自己 suspend。使用者自己
+      // 按的暫停要尊重，其他情況要救回來。
+      if (ctx.state === "suspended" && !this.userPaused) {
+        await ctx.resume().catch(() => {});
+      }
+      // 不用 decodeAudioData。那是給壓縮格式的通用解碼器，對它送什麼進去、
+      // 它為什麼失敗，我們都看不見——而這裡本來就是未壓縮的 16-bit PCM，
+      // 自己填 AudioBuffer 反而完全可預期。順帶也讓 WAV 的解析只有一份實作。
+      const w = parseWav(arrayBuffer);
+      if (!w || w.bits !== 16) throw new Error(`無法解析音訊塊（bits=${w && w.bits}）`);
+      const frames = w.data.byteLength / 2 / w.channels;
+      const audio = ctx.createBuffer(w.channels, frames, w.rate);
+      const dv = new DataView(w.data);
+      for (let ch = 0; ch < w.channels; ch++) {
+        const out = audio.getChannelData(ch);
+        for (let i = 0; i < frames; i++) {
+          out[i] = dv.getInt16((i * w.channels + ch) * 2, true) / 32768;
+        }
+      }
       if (session !== this.session) return;       // 解碼期間被換掉了
       const src = ctx.createBufferSource();
       src.buffer = audio;
@@ -292,6 +319,11 @@ class GaplessPlayer {
       this.scheduled = this.nextAt - this.startAt;
       this.sources.push(src);
       src.onended = () => { this.sources = this.sources.filter(s => s !== src); };
+      bar.sync();
+    }).catch(err => {
+      // 播不出來要講出來，不要只是安靜地不動
+      this.onError && this.onError(err);
+      this.chain = Promise.resolve();             // 別讓一次失敗毒死後面每一塊
     });
   }
   stop() {
@@ -300,19 +332,32 @@ class GaplessPlayer {
     this.sources = [];
     this.nextAt = 0; this.startAt = 0; this.scheduled = 0;
     this.live = false;
-    if (this.ctx && this.ctx.state === "suspended") this.ctx.resume();
+    this.userPaused = false;
+    if (this.ctx && this.ctx.state === "suspended") this.ctx.resume().catch(() => {});
     bar.hide();
   }
   // 暫停用 ctx.suspend()：時間軸整條凍住，所有排好的絕對時間仍然對得上，
   // 恢復後接著走，不必重排。
-  async pause()  { if (this.ctx) { await this.ctx.suspend(); bar.sync(); } }
-  async resume() { if (this.ctx) { await this.ctx.resume();  bar.sync(); } }
+  async pause()  {
+    if (!this.ctx) return;
+    this.userPaused = true;
+    await this.ctx.suspend(); bar.sync();
+  }
+  async resume() {
+    if (!this.ctx) return;
+    this.userPaused = false;
+    await this.ctx.resume(); bar.sync();
+  }
   get paused()  { return !!this.ctx && this.ctx.state === "suspended"; }
   get elapsed() { return this.startAt ? Math.max(0, Math.min(this.ctx.currentTime - this.startAt, this.scheduled)) : 0; }
   get playing() { return this.startAt > 0 && (this.live || this.elapsed < this.scheduled - 0.01); }
 }
 
 const player = new GaplessPlayer();
+player.onError = (err) => {
+  $("status").innerHTML = `<span class="err">播放失敗：${esc(err.message || err)}</span>`;
+  console.error("[stream] 播放失敗", err);
+};
 
 // 卡片上的 <audio> 跟 Web Audio 是兩套輸出，誰都不知道對方在響，要手動互斥
 function pauseAllTags() {
@@ -403,15 +448,25 @@ function finish(card, head, blobs, t0) {
     + `<span class="tag">音長 ${head.total_sec}s</span>`
     + `<span class="tag">${head.chunks} 塊</span>`
     + `<span class="tag">seed ${head.seed}</span>`);
-  // 把所有塊接成一個檔，右邊就能重複聽。WAV 各自有 44 byte 檔頭，
-  // 除了第一塊都要去掉，否則播放器會在接縫處停住。
+  // 把所有塊接成一個檔，右邊就能重複聽。
+  //
+  // 這裡原本是「留下第一塊的檔頭，其餘各砍 44 byte」。兩個地方都錯：
+  // 一是 torchaudio 會多寫一個 LIST chunk，檔頭其實是 78 byte，砍 44 等於在
+  // 每個接縫塞進 34 byte 的垃圾；二是第一塊的檔頭只宣告它自己那 7 秒，播放器
+  // 照著讀，後面全部被當成不存在——畫面上寫音長 15 秒，播放器卻只有 0:07。
+  //
+  // 所以照 RIFF 規格走 chunk 找 data，取出純 PCM，最後補一個尺寸正確的檔頭。
   (async () => {
-    const parts = [];
-    for (let i = 0; i < blobs.length; i++) {
-      const ab = await blobs[i].arrayBuffer();
-      parts.push(i === 0 ? ab : ab.slice(44));
+    const pcm = [];
+    let fmt = null;
+    for (const b of blobs) {
+      const got = parseWav(await b.arrayBuffer());
+      if (!got) continue;
+      fmt = fmt || got;
+      pcm.push(got.data);
     }
-    const merged = new Blob(parts, { type: "audio/wav" });
+    if (!fmt) return;
+    const merged = new Blob([buildWav(pcm, fmt)], { type: "audio/wav" });
     const audio = document.createElement("audio");
     audio.controls = true;
     audio.src = URL.createObjectURL(merged);
@@ -423,6 +478,50 @@ function finish(card, head, blobs, t0) {
       card.el.appendChild(d);
     }
   })();
+}
+
+// 走 RIFF 的 chunk 表找 fmt 與 data，不要假設檔頭是固定長度——寫檔的工具愛加
+// 什麼 chunk 是它的自由，規格也允許。
+function parseWav(ab) {
+  const dv = new DataView(ab);
+  const tag = o => String.fromCharCode(dv.getUint8(o), dv.getUint8(o + 1),
+                                       dv.getUint8(o + 2), dv.getUint8(o + 3));
+  if (ab.byteLength < 12 || tag(0) !== "RIFF" || tag(8) !== "WAVE") return null;
+  let off = 12, fmt = null;
+  while (off + 8 <= ab.byteLength) {
+    const id = tag(off), size = dv.getUint32(off + 4, true), body = off + 8;
+    if (id === "fmt ") {
+      fmt = { channels: dv.getUint16(body + 2, true),
+              rate: dv.getUint32(body + 4, true),
+              bits: dv.getUint16(body + 14, true) };
+    } else if (id === "data" && fmt) {
+      // 宣告的長度可能超過實際收到的（串流被中斷），取兩者的小者
+      const end = Math.min(body + size, ab.byteLength);
+      return { ...fmt, data: ab.slice(body, end) };
+    }
+    off = body + size + (size % 2);      // chunk 要對齊到偶數
+  }
+  return null;
+}
+
+function buildWav(parts, fmt) {
+  const total = parts.reduce((n, p) => n + p.byteLength, 0);
+  const out = new ArrayBuffer(44 + total);
+  const dv = new DataView(out);
+  const put = (o, s) => { for (let i = 0; i < s.length; i++) dv.setUint8(o + i, s.charCodeAt(i)); };
+  const block = fmt.channels * fmt.bits / 8;
+  put(0, "RIFF");  dv.setUint32(4, 36 + total, true);  put(8, "WAVE");
+  put(12, "fmt "); dv.setUint32(16, 16, true);         dv.setUint16(20, 1, true);
+  dv.setUint16(22, fmt.channels, true);
+  dv.setUint32(24, fmt.rate, true);
+  dv.setUint32(28, fmt.rate * block, true);
+  dv.setUint16(32, block, true);
+  dv.setUint16(34, fmt.bits, true);
+  put(36, "data"); dv.setUint32(40, total, true);
+  const u8 = new Uint8Array(out);
+  let at = 44;
+  for (const p of parts) { u8.set(new Uint8Array(p), at); at += p.byteLength; }
+  return out;
 }
 
 function esc(s) {
