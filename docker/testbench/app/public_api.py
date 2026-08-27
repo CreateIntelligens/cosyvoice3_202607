@@ -246,6 +246,7 @@ def create_router(
     variant_path: Callable[[str, str], Path | None],
     to_simplified: Callable[[str, str], tuple[str, int]],
     instruct: str,
+    concurrency: int = 1,
 ) -> APIRouter:
     by_id = {v["voice_id"]: v for v in VOICES}
     # 只留參考音檔真的存在的音色。列出一個叫不動的 voice_id，呼叫端要到合成
@@ -310,8 +311,16 @@ def create_router(
                            "Authorization header 缺少或不正確。"
                            "在 Swagger 請按右上角 Authorize 填入 token（不含 Bearer 字樣）。")
 
-    # 合成本身序列化執行；這個號誌只用來決定「等多久之後回 429」。
-    gate = threading.BoundedSemaphore(1)
+    # 這道號誌管的是「/v1 同時放幾個進去合成」，以及等不到時何時回 429。
+    #
+    # 先前寫死 1，註解也說「合成本身序列化執行」——那在 server.py 還用一把全域鎖
+    # 的時候是對的，現在不是了。server.py 的 Gate 已經放行 TTS_CONCURRENCY 個，
+    # 這裡不跟著開，就等於把那個放行擋在門外：兩個 agent 仍然一個等一個。
+    #
+    # 對齊之後才拿得到實測的 1.29 倍（見 docker-compose.yaml 的併發曲線）。
+    # 天花板約 1.5 倍是算力限制，所以這個值不需要、也不應該開得比閘還大——
+    # 多放進來只會讓每一發都變慢，吞吐並不會增加。
+    gate = threading.BoundedSemaphore(max(1, concurrency))
     # 排隊人數與觀測到的每字合成秒數，用來估等待時間並寫進 429 的訊息。
     waiting = threading.Semaphore(0)
     stats = {"queued": 0, "sec_per_char": 0.26, "lock": threading.Lock()}

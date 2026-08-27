@@ -1183,6 +1183,8 @@ def _current_model() -> tuple[str, str, str]:
 
 
 app.include_router(public_api.create_router(
+    # /v1 的入場號誌要跟 Gate 一致，否則放行了也擠不進來
+    concurrency=CONCURRENCY,
     render=render,
     current_model=_current_model,
     prompts_dir=PROMPTS_DIR,
