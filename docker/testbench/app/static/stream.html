@@ -103,6 +103,15 @@
       <option value="hanji_llm">轉台文（查表＋Gemini）</option>
     </select>
 
+    <label>繁體字轉簡體字形</label>
+    <select id="simplify">
+      <option value="none">不轉換</option>
+      <option value="safe">只修會被拆成位元組的字</option>
+      <option value="full" selected>整句轉簡（預設）</option>
+    </select>
+    <div class="hint">跟試聽台同一組選項。轉台文時會保護查表換出來的詞，
+      「連紲」不會變成「连绁」——保證見 tools/taigi_check_simplify_guard.py。</div>
+
     <div class="row">
       <div>
         <label>語速</label>
@@ -184,12 +193,13 @@ $("go").onclick = async () => {
   const fd = new URLSearchParams({
     text, llm: $("llm").value, flow: "official", hift: "official",
     prompt_name: $("prompt_name").value, annotate: $("annotate").value,
-    simplify: "none", speed: $("speed").value, seed: $("seed").value || "-1",
+    simplify: $("simplify").value, speed: $("speed").value,
+    seed: $("seed").value || "-1",
   });
 
   // 送出前拍快照：合成期間使用者可能改選單，卡片要標「這段實際用的」
   const snap = { text, llm: $("llm").value, prompt: $("prompt_name").value,
-                 annotate: $("annotate").value };
+                 annotate: $("annotate").value, simplify: $("simplify").value };
   const card = newCard(snap);
   const t0 = performance.now();
   // 這一批接管播放器；上一批（不管是串流還是卡片重聽）在這裡就停了
@@ -430,6 +440,7 @@ function newCard(snap) {
       <span class="tag b">llm: ${esc(snap.llm)}</span>
       <span class="tag">音色: ${esc(snap.prompt)}</span>
       ${snap.annotate !== "none" ? `<span class="tag">${esc(snap.annotate)}</span>` : ""}
+      ${snap.simplify !== "none" ? `<span class="tag">簡體:${esc(snap.simplify)}</span>` : ""}
     </div>
     <div class="ttfa waiting"><b>—</b><span>秒後聽到第一個音</span></div>
     <div class="live">串流中…</div>

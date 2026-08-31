@@ -404,9 +404,13 @@ def create_router(
                            f"找不到語音 {req.voice_id}。可用的有："
                            f"{', '.join(available) or '（無）'}")
 
-        spoken, annotate_note, _changed = annotate_layer.apply(
+        spoken, annotate_note, changed = annotate_layer.apply(
             text, ANNOTATE, HANJI_TABLE or None)
-        spoken, _swapped = to_simplified(spoken, SIMPLIFY)
+        # 跟試聽台同一套規則：走台文查表時，繁簡轉換要避開台文漢字，否則
+        # 表換出來的「連紲」會被轉成「连绁」，讀音就壞了。
+        spoken, _swapped = to_simplified(spoken, SIMPLIFY,
+                                         protect=ANNOTATE.startswith("hanji"),
+                                         keep_words=[g for _w, g in (changed or [])])
 
         with stats["lock"]:
             stats["queued"] += 1

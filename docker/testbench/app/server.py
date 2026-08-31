@@ -21,7 +21,7 @@ import shutil
 import sys
 import threading
 import time
-from typing import NamedTuple
+from typing import Iterable, NamedTuple
 from pathlib import Path
 from urllib.parse import quote
 
@@ -255,7 +255,77 @@ def remaining_fragments(text: str) -> str:
     return "".join(seen)
 
 
-def to_simplified(text: str, mode: str) -> tuple[str, int]:
+_TAIGI_CHARS: set[str] | None = None
+
+
+# 各階段耗時。只有 TTS_PROFILE=1 才會裝，平常一行程式都不會多跑。
+#
+# 為什麼需要：開了 vLLM 之後 LLM 只佔 11%，剩下 89% 在 flow 與聲碼器——但那是
+# 從「開/關 vLLM 的總時間差」反推的，不是直接量的。要決定「降 ODE 步數」還是
+# 「動聲碼器」，得知道那 89% 裡面誰佔多少，否則就是猜。
+#
+# 每個包裝都先 cuda.synchronize()，否則 CUDA 是非同步的，時間會全部記到最後
+# 一個等待的人身上——那種數字看起來很精確，其實完全是錯的。
+PROFILE = os.environ.get("TTS_PROFILE", "0") not in ("0", "", "false", "False")
+_profile: dict[str, float] = {}
+_profile_lock = threading.Lock()
+
+
+def _timed(name: str, fn):
+    def wrapper(*args, **kwargs):
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            with _profile_lock:
+                _profile[name] = _profile.get(name, 0.0) + (time.perf_counter() - t0)
+    return wrapper
+
+
+def install_profiler(model) -> None:
+    if not PROFILE or getattr(model, "_taigi_profiled", False):
+        return
+    inner = model.model
+    model.frontend.frontend_instruct2 = _timed(
+        "frontend", model.frontend.frontend_instruct2)
+    inner.llm_job = _timed("llm", inner.llm_job)          # 在自己的執行緒裡跑
+    inner.token2wav = _timed("token2wav", inner.token2wav)
+    inner.flow.inference = _timed("flow", inner.flow.inference)
+    inner.hift.inference = _timed("hift", inner.hift.inference)
+    model._taigi_profiled = True
+    log.info("已裝上分段計時器（TTS_PROFILE=1）")
+
+
+def taigi_chars() -> set[str]:
+    """台文對照表產出的漢字裡用到的所有字。轉簡體時要避開這些。
+
+    「什麼時候該轉簡體」原本是二選一：走台文查表就整段不轉。那是因為
+    連紲 → 连绁 會改掉讀音（紲 lian5-sua3 變成 xiè）。但實際重疊很小：
+    安全表 2290 字、台文漢字 1006 字，交集只有 98 字。一刀切等於為了避開
+    4% 的風險，放棄 96% 的好處——像「墜、瑩、鐫、攜、纓」這些繁體字對台文
+    毫無影響，卻因此繼續以位元組碎片的形式送進模型，然後被漏掉或唸錯。
+
+    所以改成「轉，但避開這 98 個字」。集合從對照表算出來，不是手挑的，
+    表更新就跟著更新。
+    """
+    global _TAIGI_CHARS
+    if _TAIGI_CHARS is None:
+        try:
+            import taigi_store
+            table = taigi_store.merged(None)
+            _TAIGI_CHARS = set("".join(v for k, v in table.items() if v != k))
+        except Exception:
+            log.warning("讀不到台文對照表，繁簡轉換不做保護", exc_info=True)
+            _TAIGI_CHARS = set()
+    return _TAIGI_CHARS
+
+
+def to_simplified(text: str, mode: str, protect: bool = False,
+                  keep_words: "Iterable[str]" = ()) -> tuple[str, int]:
     """回傳轉換後的文字與換掉的字數，讓呼叫端能說明做了什麼。
 
     safe 只換「會碎片、簡體完整、且不與語料中其他字合併」的字。
@@ -263,24 +333,44 @@ def to_simplified(text: str, mode: str) -> tuple[str, int]:
     合併會一併套用——不過那些合併很多本來就是同音字（颱/台、睏/困、齣/出 在
     台語都同音），真正有風險的是 麵/面、後/后、乾/幹/干 這類。
     哪種比較好是聽出來的，不是推論出來的。
+
+    走台文查表時要保護表的產出，否則好不容易換出來的「連紲」會被轉成「连绁」，
+    讀音就跟著壞了（紲 lian5-sua3 → 绁 xiè）。保護分兩層：
+
+    - keep_words：這一次查表**實際換出來**的詞，逐字保留。精準，不會誤傷——
+      「塗」出現在華語語境裡照樣可以轉，只有查表產出的「塗跤」不動。
+    - protect：整張表用到的字（見 taigi_chars）。安全網，接住使用者自己打的
+      台文漢字——那些不在 changed 裡，但一樣不能轉。
+
+    寧可少轉也不要轉錯：少轉只是維持現狀，轉錯是讀音直接壞掉，而且很難發現。
     """
     table = T2S_SAFE if mode == "safe" else T2S_FULL if mode == "full" else None
     if not table:
         return text, 0
+    keep = taigi_chars() if protect else set()
+    # 長的優先比對，否則「塗跤」會先被「塗」吃掉
+    words = sorted({w for w in keep_words if w}, key=len, reverse=True)
 
     pieces, i = [], 0
     while i < len(text):
+        word = next((w for w in words if text.startswith(w, i)), None)
+        if word:                       # 查表換出來的詞，原樣搬過去
+            pieces.append(word)
+            i += len(word)
+            continue
         hit = None
         for span in range(min(T2S_PHRASE_MAX, len(text) - i), 1, -1):
             chunk = text[i:i + span]
             if chunk in T2S_PHRASES:
                 hit = chunk
                 break
-        if hit:
+        # 詞組裡只要有一個字要保護，整個詞組就原樣留著——換一半比不換更糟
+        if hit and not (keep and any(c in keep for c in hit)):
             pieces.append(T2S_PHRASES[hit])
             i += len(hit)
         else:
-            pieces.append(text[i].translate(table))
+            c = text[i]
+            pieces.append(c if c in keep else c.translate(table))
             i += 1
     out = "".join(pieces)
     return out, sum(1 for a, b in zip(text, out) if a != b)
@@ -574,6 +664,7 @@ def get_model(llm: str, flow: str, hift: str):
     _model = AutoModel(model_dir=str(variant_dir), load_vllm=LOAD_VLLM,
                        load_trt=LOAD_TRT, trt_concurrent=TRT_CONCURRENT)
     _loaded = combo
+    install_profiler(_model)
     return _model
 
 
@@ -616,13 +707,24 @@ def render_stream(
         log.info("stream seed=%d llm=%s prompt=%s 段數=%d text=%r",
                  used_seed, llm, source.name, len(segments), text[:60])
         index = 0
-        for piece in segments:
+        for order, piece in enumerate(segments):
+            first_of_segment = True
             for out in model.inference_instruct2(
                     piece, instruct, str(source), stream=True,
                     speed=speed, text_frontend=False):
+                audio = out["tts_speech"]
+                # 停頓接在下一段第一塊的前面，而不是自己成為一塊——否則畫面上
+                # 會多出一堆 0.3 秒的小塊，把「每塊什麼時候到」的圖弄髒。
+                if first_of_segment and order > 0 and SEGMENT_PAUSE_MS > 0:
+                    audio = torch.concat(
+                        [silence(model.sample_rate, SEGMENT_PAUSE_MS), audio], dim=1)
+                first_of_segment = False
                 index += 1
-                yield (out["tts_speech"], model.sample_rate, index,
+                yield (audio, model.sample_rate, index,
                        time.perf_counter() - t0, used_seed)
+        # 收尾留白只在非串流那條路加。串流這裡加會變成一個 0.18 秒的獨立小塊，
+        # 而這一頁的長條圖就是用來看「每塊什麼時候到」的——多一個看不懂的小塊，
+        # 只會讓人以為哪裡壞了。段落之間的停頓仍然有，那個是接在下一段前面的。
 
 
 @app.get("/api/variants")
@@ -645,7 +747,69 @@ def variants():
     }
 
 
-def split_for_synthesis(text: str, max_chars: int, comma_split: bool) -> list[str]:
+# 真正的句末。上游 split_paragraph 對中文的定義是
+#   ['。', '？', '！', '；', '：', '、', '.', '?', '!', ';']
+# 連頓號和冒號都算——但「花柳繁华地、」後面切一刀，切的是句子內部的並列，
+# 而「笑道：」後面切一刀，是把說話動詞跟它的引文拆開。模型於是把前半當成一句話
+# 講完（語調下沉收尾），後半再從頭起一句，語意還在延續而語調已經結束又重來。
+#
+# 實測紅樓夢那段 438 字：五個切點有兩個切在句子中間，正好就是聽起來卡住的地方。
+# 段落之間補多少靜音。模型講完最後一個音節就直接發 EOS，不產生收尾的留白——
+# 實測一段話結束時尾端留白是 **0 ms**，整篇最後也只有 29 ms。上游雖然有
+# max_silent_token_num=5（200 ms）在限制長靜音，但這裡連那個上限都碰不到，
+# 所以不是被砍掉，是從來就沒有。一般語感的句間停頓是 300–600 ms。
+#
+# 各段是各自獨立的一次合成，接起來時中間什麼都沒有，聽起來就是急促。
+# 這件事我們自己補比較乾淨，不必去動模型的取樣行為。
+SEGMENT_PAUSE_MS = int(os.environ.get("SEGMENT_PAUSE_MS", "320"))
+# 切段策略。sentence = 只在真正的句末切（。！？）再併回上限以內；
+# legacy = 上游 split_paragraph 的行為，連 、 ： ； 都當句末。
+# 留這個開關是因為「聽起來比較順」不是我能替人判斷的事，改壞了要能一秒切回去。
+SPLIT_MODE = os.environ.get("SPLIT_MODE", "sentence")
+# 整篇最後也補一點，否則收在半空中。比段落之間短，因為後面沒有東西要接。
+TAIL_PAUSE_MS = int(os.environ.get("TAIL_PAUSE_MS", "180"))
+
+
+def silence(sample_rate: int, ms: int) -> torch.Tensor:
+    return torch.zeros(1, max(0, int(sample_rate * ms / 1000)))
+
+
+SENTENCE_END = "。！？!?…"
+# 句末標點後面可能還跟著收尾的引號或括號，那些要留在前一句
+CLOSERS = "”’」』）)》〉】"
+
+
+def by_sentence(text: str, max_chars: int) -> list[str]:
+    """照真正的句末切，再把連續的短句併回上限以內。
+
+    併回去是有意義的：段落之間沒有韻律連續性（各自是一次獨立的合成），所以段落
+    越少越好。在上限之內盡量塞滿，等於把接縫數量壓到最低。
+    """
+    sentences: list[str] = []
+    start = i = 0
+    while i < len(text):
+        if text[i] in SENTENCE_END:
+            j = i + 1
+            while j < len(text) and text[j] in SENTENCE_END + CLOSERS:
+                j += 1
+            sentences.append(text[start:j])
+            start = i = j
+        else:
+            i += 1
+    if start < len(text):
+        sentences.append(text[start:])
+
+    merged: list[str] = []
+    for s in (x for x in sentences if x.strip()):
+        if merged and len(merged[-1]) + len(s) <= max_chars:
+            merged[-1] += s
+        else:
+            merged.append(s)
+    return merged
+
+
+def split_for_synthesis(text: str, max_chars: int, comma_split: bool,
+                        mode: str | None = None) -> list[str]:
     """把長文切成模型吃得下的段落。短文原樣回傳，不動它。
 
     先在句末標點切，那是最自然的停頓。但一段話可能整段只有逗號、句號只在最後
@@ -663,7 +827,10 @@ def split_for_synthesis(text: str, max_chars: int, comma_split: bool) -> list[st
             merge_len=20, comma_split=commas) if p.strip()]
 
     pieces: list[str] = []
-    for piece in by_punctuation(text, False) or [text]:
+    first_pass = (by_sentence(text, max_chars)
+                  if (mode or SPLIT_MODE) == "sentence"
+                  else by_punctuation(text, False))
+    for piece in first_pass or [text]:
         if len(piece) <= max_chars or not comma_split:
             # 關閉逗號切時，過長的段落原樣送出——模型可能講不完，但至少不會
             # 在句子中間斷開。日誌會把「太短」標出來，聽的人知道發生了什麼。
@@ -700,6 +867,10 @@ def render(
     note: str = "",
     max_chunk_chars: int = 0,
     comma_split: bool = COMMA_SPLIT,
+    # 這兩個做成逐次請求可指定，是為了能在同一次載入裡直接 A/B——每比一次就
+    # 重啟一次要付八分鐘的冷啟動，那會讓人懶得比，然後靠猜。
+    segment_pause_ms: int | None = None,
+    split_mode: str | None = None,
 ) -> Rendered:
     """Synthesise one utterance.
 
@@ -727,7 +898,12 @@ def render(
             model = get_model(llm, flow, hift)
             used_seed = apply_seed(seed)
         # 種子只設一次，之後 RNG 自然往下走——與上游逐段合成的行為一致。
-        segments = split_for_synthesis(text, max_chunk_chars, comma_split)
+        if PROFILE:
+            with _profile_lock:
+                _profile.clear()
+        wall0 = time.perf_counter()
+        pause = SEGMENT_PAUSE_MS if segment_pause_ms is None else segment_pause_ms
+        segments = split_for_synthesis(text, max_chunk_chars, comma_split, split_mode)
         log.info(
             "render seed=%d llm=%s flow=%s hift=%s prompt=%s speed=%s %s "
             "段數=%d text=%r",
@@ -770,6 +946,10 @@ def render(
                 else:
                     log.info("  第 %d/%d 段 %.1f 秒 / %d 字",
                              index, len(segments), seconds, len(piece))
+                # 段落之間補停頓。要在這裡插，不是在每一塊之間——塊與塊之間
+                # 有重疊相加，本來就是連續的。
+                if chunks and pause > 0:
+                    chunks.append(silence(model.sample_rate, pause))
                 chunks.extend(got)
             if empty:
                 log.warning("共 %d/%d 段沒有聲音（第 %s 段），輸出會比預期短",
@@ -796,6 +976,20 @@ def render(
             ) from error
         if not chunks:
             raise HTTPException(500, "model produced no audio")
+        if PROFILE:
+            wall = time.perf_counter() - wall0
+            with _profile_lock:
+                got = dict(_profile)
+            # token2wav 已經包含 flow 與 hift，所以扣掉才是它自己的膠水成本
+            glue = got.get("token2wav", 0) - got.get("flow", 0) - got.get("hift", 0)
+            named = sum(got.get(k, 0) for k in ("frontend", "llm", "token2wav"))
+            parts = [("前處理", got.get("frontend", 0)), ("LLM", got.get("llm", 0)),
+                     ("flow", got.get("flow", 0)), ("聲碼器", got.get("hift", 0)),
+                     ("token2wav 其他", glue), ("未計入", wall - named)]
+            log.info("分段耗時 總計 %.2fs｜%s", wall,
+                     "  ".join(f"{n} {v:.2f}s({v / wall * 100:.0f}%)" for n, v in parts))
+        if chunks and TAIL_PAUSE_MS > 0 and pause > 0:
+            chunks.append(silence(model.sample_rate, TAIL_PAUSE_MS))
         return Rendered(torch.concat(chunks, dim=1), model.sample_rate,
                         used_seed, llm, flow, hift)
 
@@ -838,6 +1032,10 @@ def tts(
     # 長文自動分段。預設開啟——關掉的話 200 字以上就會生出一段講不完的音檔。
     # 要逐字對照的實驗才關（設 0）。
     max_chunk_chars: int = Form(MAX_CHUNK_CHARS),
+    # 段落停頓與切段策略，留空就用伺服器預設。做成參數是為了能在同一次載入裡
+    # 直接比較，不必為了換一個數字重啟。
+    segment_pause_ms: int = Form(-1),
+    split_mode: str = Form(""),
     # 逗號切預設照環境變數，但試聽台可以逐次覆寫，方便直接 A/B 兩種切法。
     comma_split: bool = Form(COMMA_SPLIT),
     seed: int = Form(-1),
@@ -859,13 +1057,17 @@ def tts(
         raise HTTPException(400, "preview_override 不是合法 JSON")
     text, annotate_note, annotate_changed = annotate_layer.apply(
         text, annotate, hanji_table or None, extra)
-    # 台文模式之後不能再繁簡轉換。繁簡轉換是為華語輸入設計的（避免罕見繁體字被
-    # 拆成位元組），但台語漢字轉簡體會被換成讀音不同的華語字——「連紲」變「连绁」，
-    # 紲 lian5-sua3 變成 绁 xiè，模型就唸成 lian5-sia。台羅模式沒事，因為那不是漢字。
-    if annotate.startswith("hanji"):
-        simplify, swapped = "none", 0
-    else:
-        text, swapped = to_simplified(text, simplify)
+    # 繁簡轉換與台文查表原本是二選一：走查表就整段不轉，因為台語漢字轉簡體會被
+    # 換成讀音不同的華語字——「連紲」變「连绁」，紲 lian5-sua3 變成 绁 xiè。
+    #
+    # 但那是為了避開 98 個字，放棄了另外 2192 個。像「墜、瑩、鐫、攜、纓」這些
+    # 繁體字對台文毫無影響，卻因此繼續碎片化，然後被模型漏掉或唸錯——實測 71 字
+    # 的紅樓夢段落就掉了「成扇墜一般，甚屬」。
+    #
+    # 現在改成兩件事都做：照樣轉，但避開對照表產出的台文漢字（見 taigi_chars）。
+    text, swapped = to_simplified(text, simplify,
+                                  protect=annotate.startswith("hanji"),
+                                  keep_words=[got for _w, got in (annotate_changed or [])])
     unfixable = remaining_fragments(text)
 
     # Form(DEFAULT_INSTRUCT) only fires when the field is absent, but the page always
@@ -917,6 +1119,8 @@ def tts(
             speed=speed, text_frontend=text_frontend, seed=seed,
             max_chunk_chars=0 if text_frontend else max_chunk_chars,
             comma_split=comma_split,
+            segment_pause_ms=None if segment_pause_ms < 0 else segment_pause_ms,
+            split_mode=split_mode or None,
             note=f"simplify={simplify}({swapped}字) annotate={annotate_note}"
                  + (f" 仍是碎片[{unfixable}]" if unfixable else ""),
         )
@@ -1126,9 +1330,10 @@ def tts_stream(
     if not prompt_name or not source.is_file():
         raise HTTPException(400, f"unknown prompt: {prompt_name!r}")
 
-    body, _note, _changed = annotate_layer.apply(text, annotate, hanji_table or None)
-    if not annotate.startswith("hanji"):
-        body, _ = to_simplified(body, simplify)
+    body, _note, changed = annotate_layer.apply(text, annotate, hanji_table or None)
+    # 跟 /api/tts 同一套規則：照樣轉，但保護查表的產出
+    body, _ = to_simplified(body, simplify, protect=annotate.startswith("hanji"),
+                            keep_words=[got for _w, got in (changed or [])])
 
     def gen():
         try:
