@@ -34,6 +34,12 @@ services:
       # 代價：每個 checkpoint 第一次載入要多花約 3 分鐘匯出權重，之後沿用
       # （匯出檔存在 testbench-variants 這個 volume，重啟不會消失）。
       LOAD_VLLM: "1"
+      # vLLM 每次啟動引擎會把硬體與模型架構回報到 stats.vllm.ai。內容是匿名的
+      # （CPU/GPU 型號、顯存、model_architecture、版本），不含文字或音訊，但這台
+      # 是內部服務、沒必要幫上游做統計，而且少一次對外連線就少一個啟動時可能
+      # 卡住的地方。兩個變數任一個都能關，一起設是為了將來換版本也還管用。
+      VLLM_NO_USAGE_STATS: "1"
+      DO_NOT_TRACK: "1"
       # 併發名額。指定 seed 的請求一律獨佔（見 server.py 的 Gate），這裡管的是
       # 隨機 seed 的請求能同時跑幾個。
       #

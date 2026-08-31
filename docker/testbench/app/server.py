@@ -59,8 +59,29 @@ from cosyvoice.utils.frontend_utils import split_paragraph  # noqa: E402
 
 import public_api  # noqa: E402  對外 /v1 介面，見 public_api.py
 
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("testbench")
+
+# cosyvoice/utils/file_utils.py 匯入時會呼叫 logging.basicConfig(level=DEBUG)，
+# 而 basicConfig 只有第一次有效——上面那行設的 INFO 會被它蓋掉，結果是根 logger
+# 停在 DEBUG，第三方套件的內部訊息全部印出來。實測日誌有三分之一是
+# python-multipart 在報「解析到第幾個表單欄位」，而且每個請求印一輪。
+#
+# 匯入之後把層級搶回來，並且把幾個特別吵的套件單獨壓到 WARNING。
+# 要看它們的細節就設 LOG_LEVEL=DEBUG。
+def _quiet_third_party() -> None:
+    want = os.environ.get("LOG_LEVEL", "INFO").upper()
+    logging.getLogger().setLevel(getattr(logging, want, logging.INFO))
+    if want == "DEBUG":
+        return
+    for name in ("multipart", "python_multipart", "urllib3", "httpx", "httpcore",
+                 "asyncio", "filelock", "modelscope", "matplotlib"):
+        logging.getLogger(name).setLevel(logging.WARNING)
+
+
+# 上面那些 cosyvoice 的 import 已經把 root logger 拉到 DEBUG 了，這裡搶回來
+_quiet_third_party()
 
 MODELS_ROOT = Path(os.environ.get("MODELS_ROOT", "/models"))
 BASE_DIR = MODELS_ROOT / "base"
