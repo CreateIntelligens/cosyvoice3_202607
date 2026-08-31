@@ -272,6 +272,11 @@ _profile_lock = threading.Lock()
 
 
 def _timed(name: str, fn):
+    """記下每一次呼叫的起訖時刻，不是只累加時間。
+
+    只累加的話，併發時各執行緒的數字會混在一起，而且看不出「誰跟誰重疊」——
+    而重疊正是要判斷的事：vLLM 到底有沒有把五個請求批次在一起。
+    """
     def wrapper(*args, **kwargs):
         if torch.cuda.is_available():
             torch.cuda.synchronize()
@@ -281,9 +286,60 @@ def _timed(name: str, fn):
         finally:
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
+            t1 = time.perf_counter()
             with _profile_lock:
-                _profile[name] = _profile.get(name, 0.0) + (time.perf_counter() - t0)
+                _profile[name] = _profile.get(name, 0.0) + (t1 - t0)
+            log.info("PROF %s thread=%d t0=%.4f t1=%.4f dur=%.3f",
+                     name, threading.get_ident(), t0, t1, t1 - t0)
     return wrapper
+
+
+# 參考音檔的前處理結果快取。
+#
+# frontend_zero_shot 在 zero_shot_spk_id == '' 時，每一次請求都對同一個參考音檔
+# 重跑三件事：mel、speech token（那顆 969 MB 的 ONNX）、語者嵌入。三者只跟音檔
+# 有關，而音色只有二十幾個固定檔案——實測前處理佔一次合成的 14–23%，那整塊是
+# 純粹的重複計算。
+#
+# 上游本來就留了路：add_zero_shot_spk() 把結果存進 frontend.spk2info，
+# inference_instruct2() 也早就收 zero_shot_spk_id 參數，我們只是沒用。
+#
+# 算出來的東西逐位元相同，所以這是沒有音質代價的加速——跟降 ODE 步數那種
+# 拿品質換速度的做法不一樣。
+SPK_CACHE = os.environ.get("SPK_CACHE", "1") not in ("0", "", "false", "False")
+_spk_cache: dict[tuple, str] = {}
+_spk_cache_lock = threading.Lock()
+
+
+def cached_spk(model, source: Path, instruct: str) -> str:
+    """回傳這個（參考音檔, instruct）對應的 spk id，沒有就先算一次。
+
+    instruct 也要進 key：它在 instruct2 這條路上扮演 prompt_text，換了它
+    註冊出來的 prompt_text_token 就不一樣。
+
+    檔案的大小與 mtime 也進 key，音色檔換掉時快取才會自動失效。
+    """
+    if not SPK_CACHE:
+        return ""
+    try:
+        st = source.stat()
+    except OSError:
+        return ""
+    key = (str(source), st.st_size, st.st_mtime_ns, instruct)
+    with _spk_cache_lock:
+        got = _spk_cache.get(key)
+        # 換過模型的話 frontend 是新的，spk2info 會是空的——要重算
+        if got and got in model.frontend.spk2info:
+            return got
+        spk_id = f"cache-{len(_spk_cache)}"
+        try:
+            model.add_zero_shot_spk(instruct, str(source), spk_id)
+        except Exception:
+            log.warning("參考音檔前處理快取失敗，這次照舊重算", exc_info=True)
+            return ""
+        _spk_cache[key] = spk_id
+        log.info("已快取參考音檔前處理：%s", source.name)
+        return spk_id
 
 
 def install_profiler(model) -> None:
@@ -664,6 +720,8 @@ def get_model(llm: str, flow: str, hift: str):
     _model = AutoModel(model_dir=str(variant_dir), load_vllm=LOAD_VLLM,
                        load_trt=LOAD_TRT, trt_concurrent=TRT_CONCURRENT)
     _loaded = combo
+    with _spk_cache_lock:
+        _spk_cache.clear()      # 新的 frontend 有新的 spk2info，舊 id 全部作廢
     install_profiler(_model)
     return _model
 
@@ -711,6 +769,7 @@ def render_stream(
             first_of_segment = True
             for out in model.inference_instruct2(
                     piece, instruct, str(source), stream=True,
+                    zero_shot_spk_id=cached_spk(model, source, instruct),
                     speed=speed, text_frontend=False):
                 audio = out["tts_speech"]
                 # 停頓接在下一段第一塊的前面，而不是自己成為一塊——否則畫面上
@@ -922,8 +981,10 @@ def render(
             chunks = []
             empty: list[int] = []
             for index, piece in enumerate(segments, 1):
+                spk = cached_spk(model, source, instruct)
                 got = [out["tts_speech"] for out in model.inference_instruct2(
                     piece, instruct, str(source), stream=False,
+                    zero_shot_spk_id=spk,
                     speed=speed, text_frontend=text_frontend,
                 )]
                 produced = sum(c.shape[1] for c in got)
