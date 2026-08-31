@@ -317,9 +317,10 @@ def create_router(
     # 的時候是對的，現在不是了。server.py 的 Gate 已經放行 TTS_CONCURRENCY 個，
     # 這裡不跟著開，就等於把那個放行擋在門外：兩個 agent 仍然一個等一個。
     #
-    # 對齊之後才拿得到實測的 1.29 倍（見 docker-compose.yaml 的併發曲線）。
-    # 天花板約 1.5 倍是算力限制，所以這個值不需要、也不應該開得比閘還大——
-    # 多放進來只會讓每一發都變慢，吞吐並不會增加。
+    # 這個值不該開得比閘還大。理由不是吞吐（那個指標選錯了），是延遲分佈：
+    # 五個請求同時進來時，閘開到 5 會讓每個人都等 8.8s，開 2 則是前兩位 4.7s、
+    # 平均等待反而更短。多放進來只是把所有人一起拉到最慢。
+    # 完整的分佈表在 docker-compose.yaml 的 TTS_CONCURRENCY 註解。
     gate = threading.BoundedSemaphore(max(1, concurrency))
     # 排隊人數與觀測到的每字合成秒數，用來估等待時間並寫進 429 的訊息。
     waiting = threading.Semaphore(0)

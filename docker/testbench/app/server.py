@@ -137,15 +137,20 @@ COMMA_SPLIT = os.environ.get("COMMA_SPLIT", "0") not in ("0", "", "false", "Fals
 
 # frontend.py asserts this before extracting speech tokens; catching it here turns
 # an opaque 500 into something the caller can act on.
-# vLLM 加速 LLM 那一段。實測 RTF 從 1.35 降到 0.39（LLM 10.33s → 2.01s，快 5.1 倍）。
+# vLLM 加速 LLM 那一段。早期在長文上量到 RTF 1.35 → 0.39（LLM 10.33s → 2.01s）。
+# 那個 5.1 倍只適用於當時那段文字，不要拿去反推佔比——我這樣做過，得出「LLM 只佔
+# 11%」的錯誤結論。要佔比就開 TTS_PROFILE=1 直接量。
 #
 # 預設關閉，兩個原因：一是它要 torch 2.7 + vllm 0.9 的環境（見 docker/vllm-test），
 # 正式映像跑的是 torch 2.3.1；二是它第一次載入要多花約 3 分鐘匯出權重，而試聽台
 # 的用途是一直換模型比較——那個成本在對外服務上划算，在研究工具上不划算。
 LOAD_VLLM = os.environ.get("LOAD_VLLM", "0") not in ("0", "", "false", "False")
 
-# flow decoder 走 TensorRT。只開 vLLM 的話 LLM 快了 5 倍，但 flow 沒動——它的
-# 佔比就從 15% 變成 37%，變成新的瓶頸。社群拆解的數字也是聲碼器約 32%。
+# flow decoder 走 TensorRT。動機是 flow 佔了三分之一（實測 34–46%，視文長而定），
+# 而 vLLM 只加速 LLM 那半。
+#
+# 但**實測 TRT 沒有可量到的好處**，所以 compose 裡是關的：同條件 A/B 三個數字的
+# 差異都落在單發本身 ±10% 的散佈裡。詳見 docker-compose.yaml 的 LOAD_TRT 註解。
 #
 # 第一次要把 ONNX 編譯成 TRT 引擎（十幾分鐘），之後沿用。需要
 # flow.decoder.estimator.fp32.onnx 在模型目錄裡，用 cosyvoice/bin/export_onnx.py 產生。
@@ -261,9 +266,15 @@ _TAIGI_CHARS: set[str] | None = None
 
 # 各階段耗時。只有 TTS_PROFILE=1 才會裝，平常一行程式都不會多跑。
 #
-# 為什麼需要：開了 vLLM 之後 LLM 只佔 11%，剩下 89% 在 flow 與聲碼器——但那是
-# 從「開/關 vLLM 的總時間差」反推的，不是直接量的。要決定「降 ODE 步數」還是
-# 「動聲碼器」，得知道那 89% 裡面誰佔多少，否則就是猜。
+# 為什麼需要：先前用「開/關 vLLM 的總時間差」反推，得到「LLM 只佔 11%」——那是
+# 錯的，而且錯得離譜。直接量的結果（快取後、30 字）：
+#
+#     前處理  0.00s（快取命中）    LLM  1.20s  49%
+#     flow    1.15s  46%           聲碼器 0.12s  5%
+#
+# 差別大到會改變決策：11% 的話 Amdahl 上限只有 1.13 倍、批次 LLM 沒意義；
+# 實際 49% 才解釋得了為什麼 vLLM 值得，以及為什麼併發只到 1.5 倍（flow 那半
+# 完全沒批次）。反推不算量測。
 #
 # 每個包裝都先 cuda.synchronize()，否則 CUDA 是非同步的，時間會全部記到最後
 # 一個等待的人身上——那種數字看起來很精確，其實完全是錯的。
@@ -345,9 +356,15 @@ def cached_spk(model, source: Path, instruct: str) -> str:
 
 # flow 那段做多少事。這是唯一能直接砍掉瓶頸的旋鈕，但**拿音質換速度**。
 #
-# 實測五併發 13.37s 的組成是 LLM 1.92s + flow 6.64s + 其餘 4.81s。LLM 已經被
-# vLLM 批次得很好（五倍工作只花 1.6 倍），flow 完全沒批次（五倍工作花 5.8 倍）。
-# 在有人把 flow 跨請求批次化之前，唯一能動 flow 的就是讓它少做一點。
+# 階段計時（五併發、30 字）顯示：LLM 1.92s、token2wav 7.27s、其餘 4.33s。
+# 那個「其餘」後來查出是 StreamingResponse(BytesIO) 把音檔按行切成三千段，已修，
+# 五併發因此從 14.0s 降到 8.9s。剩下的是 LLM 與 flow，而兩者的性質完全不同：
+#
+#   LLM   五倍工作只花 1.6 倍 —— vLLM 真的在批次
+#   flow  五倍工作花 5.8 倍   —— 只是輪流跑，總量沒省
+#
+# flow 的 batch 在 solve_euler 裡寫死成 2（CFG 的兩份），跨請求不會合併。在有人
+# 把它批次化之前，唯一能動 flow 的就是讓它少做一點——而那要拿音質換。
 #
 #   FLOW_TIMESTEPS  Euler 解幾步，上游是 10。線性影響耗時。
 #   FLOW_CFG        classifier-free guidance。上游 solve_euler 把張量寫死成
