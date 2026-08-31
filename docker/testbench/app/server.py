@@ -29,7 +29,8 @@ import soundfile as sf
 import torch
 import torchaudio
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import (FileResponse, JSONResponse, Response,
+                              StreamingResponse)
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -340,6 +341,74 @@ def cached_spk(model, source: Path, instruct: str) -> str:
         _spk_cache[key] = spk_id
         log.info("已快取參考音檔前處理：%s", source.name)
         return spk_id
+
+
+# flow 那段做多少事。這是唯一能直接砍掉瓶頸的旋鈕，但**拿音質換速度**。
+#
+# 實測五併發 13.37s 的組成是 LLM 1.92s + flow 6.64s + 其餘 4.81s。LLM 已經被
+# vLLM 批次得很好（五倍工作只花 1.6 倍），flow 完全沒批次（五倍工作花 5.8 倍）。
+# 在有人把 flow 跨請求批次化之前，唯一能動 flow 的就是讓它少做一點。
+#
+#   FLOW_TIMESTEPS  Euler 解幾步，上游是 10。線性影響耗時。
+#   FLOW_CFG        classifier-free guidance。上游 solve_euler 把張量寫死成
+#                   [2, 80, T]，每一步都算「有條件」和「無條件」兩份再加權。
+#                   關掉只算一份，flow 直接省一半——但 CFG 是拿來提高與參考音的
+#                   相似度的，關掉音色會飄多少只能聽。
+FLOW_TIMESTEPS = int(os.environ.get("FLOW_TIMESTEPS", "0") or 0) or None
+FLOW_CFG = os.environ.get("FLOW_CFG", "1") not in ("0", "", "false", "False")
+
+
+def _solve_euler_no_cfg(cfm, x, t_span, mu, mask, spks, cond, streaming=False):
+    """跟上游 solve_euler 一樣，但只算有條件那一份。
+
+    上游即使 inference_cfg_rate 設 0 也照樣跑 batch 2 再把兩份加權——設定改不掉
+    這件事，要省就得換掉整個迴圈。
+    """
+    t = t_span[0].unsqueeze(dim=0)
+    dt = t_span[1] - t_span[0]
+    for step in range(1, len(t_span)):
+        dphi_dt = cfm.forward_estimator(x, mask, mu, t, spks, cond, streaming)
+        x = x + dt * dphi_dt
+        t = t + dt
+        if step < len(t_span) - 1:
+            dt = t_span[step + 1] - t
+    return x.float()
+
+
+# 上游在每個 tts() 結束時都呼叫 torch.cuda.empty_cache()。那個操作會拿走配置器
+# 的全域鎖、把所有快取的區塊還給驅動——併發時五個執行緒輪流做，其他人的配置全部
+# 卡住，而且之後每次配置都得重新跟驅動要，等於自己製造停頓。
+#
+# 它原本是為了「一直換模型」的情境寫的（釋放上一個模型的碎片）。我們換模型時
+# 本來就會自己清，服務期間不需要。
+#
+# 保留一個真正需要的出口：render() 撞到 OOM 時要清一次再回報，那條路直接呼叫
+# 底下的原函式。
+SKIP_EMPTY_CACHE = os.environ.get("SKIP_EMPTY_CACHE", "0") not in ("0", "", "false", "False")
+_real_empty_cache = torch.cuda.empty_cache
+
+if SKIP_EMPTY_CACHE:
+    torch.cuda.empty_cache = lambda: None
+    log.info("已停用每次合成後的 torch.cuda.empty_cache()")
+
+
+def install_flow_knobs(model) -> None:
+    if getattr(model, "_taigi_flow_knobs", False):
+        return
+    if not FLOW_TIMESTEPS and FLOW_CFG:
+        return                                    # 都是預設，不要碰
+    cfm = model.model.flow.decoder
+    original_forward = cfm.forward
+
+    def forward(mu, mask, n_timesteps, *args, **kwargs):
+        return original_forward(mu, mask, FLOW_TIMESTEPS or n_timesteps, *args, **kwargs)
+
+    cfm.forward = forward
+    if not FLOW_CFG:
+        cfm.solve_euler = lambda *a, **kw: _solve_euler_no_cfg(cfm, *a, **kw)
+    model._taigi_flow_knobs = True
+    log.info("flow 旋鈕：步數 %s，CFG %s",
+             FLOW_TIMESTEPS or "10（預設）", "開" if FLOW_CFG else "關")
 
 
 def install_profiler(model) -> None:
@@ -723,6 +792,7 @@ def get_model(llm: str, flow: str, hift: str):
     with _spk_cache_lock:
         _spk_cache.clear()      # 新的 frontend 有新的 spk2info，舊 id 全部作廢
     install_profiler(_model)
+    install_flow_knobs(_model)
     return _model
 
 
@@ -1020,7 +1090,7 @@ def render(
             # The card is shared with other services, so the usable headroom moves
             # around. Report what is actually free instead of a bare traceback.
             free, total = torch.cuda.mem_get_info()
-            torch.cuda.empty_cache()
+            _real_empty_cache()
             raise HTTPException(
                 503,
                 f"GPU 記憶體不足（可用 {free / 2**20:.0f} MiB / 共 {total / 2**20:.0f} MiB）。"
@@ -1175,6 +1245,7 @@ def tts(
                     400, f"參考音檔只有 {duration:.2f} 秒，太短不足以描述音色，請用 3 秒以上。"
                 )
 
+        _tr = time.perf_counter()
         out = render(
             text, llm=llm, flow=flow, hift=hift, instruct=instruct, source=Path(source),
             speed=speed, text_frontend=text_frontend, seed=seed,
@@ -1185,16 +1256,35 @@ def tts(
             note=f"simplify={simplify}({swapped}字) annotate={annotate_note}"
                  + (f" 仍是碎片[{unfixable}]" if unfixable else ""),
         )
+        if PROFILE:
+            log.info("PROF render thread=%d t0=%.4f t1=%.4f dur=%.3f",
+                     threading.get_ident(), _tr, time.perf_counter(),
+                     time.perf_counter() - _tr)
         audio, sample_rate, used_seed = out.audio, out.sample_rate, out.seed
     finally:
         if tmp_prompt is not None:
             tmp_prompt.unlink(missing_ok=True)
 
+    _t = time.perf_counter()
     buf = io.BytesIO()
     torchaudio.save(buf, audio, sample_rate, format="wav")
     buf.seek(0)
-    return StreamingResponse(
-        buf,
+    if PROFILE:
+        log.info("PROF encode thread=%d t0=%.4f t1=%.4f dur=%.3f",
+                 threading.get_ident(), _t, time.perf_counter(),
+                 time.perf_counter() - _t)
+    # 一次把整個位元組送出，不要用 StreamingResponse(BytesIO)。
+    #
+    # StreamingResponse 收到 file-like 物件會去**迭代**它，而迭代 BytesIO 是按行
+    # 切的——以 0x0A 為分隔。WAV 是二進位，到處都是那個位元組：一個 354 KB 的
+    # 音檔被切成 3,221 段、每段平均 113 bytes，每一段都是一次執行緒池往返加一次
+    # ASGI send。五個併發就是一萬六千次。
+    #
+    # 實測：伺服器 9.18s 就把回應準備好，客戶端 13.25s 才拿到——那 4 秒全在這裡。
+    # 音檔本來就已經整份在記憶體裡，沒有任何東西需要串流。真正要串流的是
+    # /api/tts/stream，那條路用的是產生器，不受影響。
+    return Response(
+        content=buf.getvalue(),
         media_type="audio/wav",
         headers={
             "X-Variant": f"llm={llm};flow={flow};hift={hift}",
