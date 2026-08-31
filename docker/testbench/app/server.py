@@ -38,6 +38,22 @@ COSYVOICE_ROOT = os.environ.get("COSYVOICE_ROOT", "/opt/CosyVoice")
 sys.path.insert(0, COSYVOICE_ROOT)
 sys.path.insert(0, f"{COSYVOICE_ROOT}/third_party/Matcha-TTS")
 
+# CosyVoiceFrontEnd 建構時會試著載入 wetext 的文字正規化器，而那會去 ModelScope
+# 下載 30 MB。實測那個下載一直被 403 限流：每個檔重試五次、退避等待，跑了
+# 4 分 41 秒之後仍然失敗，最後印出 "no frontend is avaliable"——也就是說那四分多鐘
+# 完全白費，而且每次容器重建都要再來一次（快取在容器內）。
+#
+# 更關鍵的是我們根本不用它：所有入口的 text_frontend 都是 False（見 Form(False)
+# 與 render_stream），因為它同時做數字正規化與去括號，那些對實驗對照是變數。
+# 切段我們自己做。
+#
+# 所以讓那個 import 直接失敗，結果跟現在一樣（text_frontend=''），只是省下五分鐘。
+# 真的想用的話設 SKIP_TEXT_FRONTEND=0，但要先確認 ModelScope 那邊不再擋。
+if os.environ.get("SKIP_TEXT_FRONTEND", "1") not in ("0", "", "false", "False"):
+    import types
+    sys.modules.setdefault("wetext", types.ModuleType("wetext"))   # 沒有 Normalizer
+    sys.modules.setdefault("ttsfrd", types.ModuleType("ttsfrd"))
+
 from cosyvoice.cli.cosyvoice import AutoModel  # noqa: E402
 from cosyvoice.utils.frontend_utils import split_paragraph  # noqa: E402
 
@@ -825,6 +841,7 @@ def render_stream(
     seed: int,
     max_chunk_chars: int = MAX_CHUNK_CHARS,
     comma_split: bool = COMMA_SPLIT,
+    started: float | None = None,
 ):
     """逐塊產出音訊，而不是等整段合成完。
 
@@ -837,7 +854,10 @@ def render_stream(
     併發規則跟 render() 一樣走 _gate。串流會把閘佔得比較久（要等整段送完），
     所以指定 seed 的串流請求會明顯擋住別人——這是重現性的代價，不是 bug。
     """
-    t0 = time.perf_counter()
+    # 計時從**請求進來**算起，不是從這裡。標音層（可能要問 LLM，1.5–3.5 秒）
+    # 跑在這個函式之前，起點放這裡會把那段藏起來——而「多久聽得到第一個音」
+    # 正是要含它才有意義。
+    t0 = time.perf_counter() if started is None else started
     exclusive = seed >= 0
     with _gate.hold(exclusive):
         with _lock:
@@ -890,7 +910,21 @@ def variants():
         # 頁面的預設選擇。跟 /v1 掛的是同一組，換版本只要改 .env，
         # 不必再回來改前端寫死的名字（先前寫死 llm_v2_best，早就過期了）。
         "startup": dict(zip(PARTS, startup_model())),
+        # 「直接問 LLM」那兩個模式會用誰。頁面標出來，才不會以為還在用舊供應商——
+        # 換 .env 是伺服器端的事，前端看不到。
+        "llm": _llm_info(),
     }
+
+
+def _llm_info() -> dict:
+    provider = annotate_layer.LLM_PROVIDER
+    model = (annotate_layer.LLM_MODEL
+             or (os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite")
+                 if provider == "gemini" else "gpt-5.5"))
+    key = "OPENAI_API_KEY" if provider == "openai" else "GEMINI_API_KEY"
+    return {"provider": provider, "model": model,
+            "ready": bool(os.environ.get(key, "")),
+            "reasoning": annotate_layer.LLM_REASONING if provider == "openai" else ""}
 
 
 # 真正的句末。上游 split_paragraph 對中文的定義是
@@ -1146,6 +1180,64 @@ class Health(BaseModel):
     cuda: bool
     device: str | None
     loaded: list[str] | None
+    # 啟動時的暖機進度。頁面靠它區分「還在載入」與「壞了」——那兩件事
+    # 從外面看一模一樣，而模型要兩分鐘才上得了 GPU。
+    warmup: str = ""
+    warmup_detail: str = ""
+
+
+# 啟動就把模型載好，不要讓第一個使用者幫大家暖機。
+#
+# 原本是懶載入：容器 Up、頁面能開、health 回 200，但第一發合成要等兩分鐘
+# （載權重 + vLLM 引擎 + CUDA graph 捕捉）。從外面看就像「服務壞了」——
+# 我自己也被騙過好幾次。
+#
+# 在背景執行緒做，不擋住 uvicorn 起來：health 要能立刻回應，compose 的健康
+# 檢查與反向代理才不會以為它掛了。載完再合成一小句，把 CUDA kernel 那些
+# 第一次才會付的成本也一起付掉。
+WARMUP = os.environ.get("WARMUP", "1") not in ("0", "", "false", "False")
+_warm = {"state": "尚未開始", "detail": ""}
+
+
+def _warmup() -> None:
+    combo = startup_model()
+    try:
+        _warm["state"] = "載入模型"
+        _warm["detail"] = "/".join(combo)
+        t0 = time.perf_counter()
+        model = get_model(*combo)
+        load = time.perf_counter() - t0
+
+        prompt = next((p for p in sorted(PROMPTS_DIR.glob("*.wav"))), None)
+        if prompt is None:
+            _warm["state"] = "就緒"
+            _warm["detail"] = f"載入 {load:.0f} 秒（沒有參考音檔，跳過試合成）"
+            log.info("暖機完成：載入 %.0f 秒，沒有參考音檔可試合成", load)
+            return
+
+        _warm["state"] = "試合成"
+        t1 = time.perf_counter()
+        # 順便把這個音色的前處理算進快取（見 cached_spk），第一個真請求就省下來
+        spk = cached_spk(model, prompt, DEFAULT_INSTRUCT)
+        list(model.inference_instruct2("暖機", DEFAULT_INSTRUCT, str(prompt),
+                                       zero_shot_spk_id=spk, stream=False,
+                                       text_frontend=False))
+        synth = time.perf_counter() - t1
+        _warm["state"] = "就緒"
+        _warm["detail"] = f"載入 {load:.0f} 秒＋試合成 {synth:.1f} 秒"
+        log.info("暖機完成：載入 %.0f 秒，試合成 %.1f 秒", load, synth)
+    except Exception as exc:
+        _warm["state"] = "失敗"
+        _warm["detail"] = f"{type(exc).__name__}: {exc}"
+        log.exception("暖機失敗，改回第一個請求時才載入")
+
+
+@app.on_event("startup")
+def _start_warmup() -> None:
+    if not WARMUP:
+        _warm["state"] = "已停用（WARMUP=0）"
+        return
+    threading.Thread(target=_warmup, name="warmup", daemon=True).start()
 
 
 @app.get("/api/health", response_model=Health)
@@ -1154,6 +1246,8 @@ def health():
         cuda=torch.cuda.is_available(),
         device=torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
         loaded=list(_loaded) if _loaded else None,
+        warmup=_warm["state"],
+        warmup_detail=_warm["detail"],
     )
 
 
@@ -1386,6 +1480,49 @@ def dicts(q: str = "", layer: str = "", limit: int = 200, offset: int = 0,
             "rows": rows[offset:offset + limit]}
 
 
+@app.get("/api/tailo")
+def tailo(q: str = "", only_multi: bool = False, limit: int = 200, offset: int = 0):
+    """瀏覽台羅對照表。**唯讀,沒有對應的修改端點**。
+
+    跟台文那張表不一樣：台文表是我們自己對齊出來的，錯了要能改；台羅這邊是
+    ChhoeTaigi 的辭典加上語料統計，改它等於改別人的辭典，而真正該修的是
+    「這個詞在這句話裡該唸哪個音」——那是 corpus_prior 與 Gemini 在做的事，
+    不是這張表。所以這裡只給看。
+
+    每一列是：詞、實際會用的讀音、其他候選、以及那個讀音是怎麼決定的。
+      corpus  語料統計選出來的（corpus_prior，4,651 詞）
+      only    辭典裡只有一個讀音，沒得選
+      first   有多個讀音但語料沒統計到，取辭典第一個
+    """
+    import sys as _sys
+    _sys.path.insert(0, "/opt/CosyVoice/tools")
+    from taigi_annotate import lexicon, corpus_prior
+    lex, prior = lexicon(), corpus_prior()
+
+    rows = []
+    for word, readings in lex.items():
+        if not readings:
+            continue
+        if q and q not in word and not any(q in r for r in readings):
+            continue
+        if len(readings) > 1 and word in prior:
+            picked, how = prior[word], "corpus"
+        elif len(readings) == 1:
+            picked, how = readings[0], "only"
+        else:
+            picked, how = readings[0], "first"
+        if only_multi and len(readings) < 2:
+            continue
+        rows.append({"word": word, "reading": picked, "how": how,
+                     "alts": [r for r in readings if r != picked]})
+    # 有得選的排前面——那些才是會唸錯的地方，也是這張表唯一值得看的部分
+    rows.sort(key=lambda r: (0 if len(r["alts"]) else 1, r["word"]))
+    return {"total": len(rows),
+            "counts": {"lexicon": len(lex), "corpus": len(prior),
+                       "multi": sum(1 for v in lex.values() if len(v) > 1)},
+            "rows": rows[offset:offset + limit]}
+
+
 @app.get("/api/suggestions")
 def suggestions():
     """看得到自己填過什麼。唯讀、不需要金鑰——這是意見，不是設定。
@@ -1498,10 +1635,12 @@ def tts_stream(
     if not prompt_name or not source.is_file():
         raise HTTPException(400, f"unknown prompt: {prompt_name!r}")
 
-    body, _note, changed = annotate_layer.apply(text, annotate, hanji_table or None)
+    req_t0 = time.perf_counter()
+    body, note, changed = annotate_layer.apply(text, annotate, hanji_table or None)
     # 跟 /api/tts 同一套規則：照樣轉，但保護查表的產出
     body, _ = to_simplified(body, simplify, protect=annotate.startswith("hanji"),
                             keep_words=[got for _w, got in (changed or [])])
+    annotate_sec = time.perf_counter() - req_t0
 
     def gen():
         try:
@@ -1510,7 +1649,7 @@ def tts_stream(
             for audio, sr, index, at, used_seed in render_stream(
                     body, llm=llm, flow=flow, hift=hift, instruct=instruct,
                     source=source, speed=speed, seed=seed,
-                    max_chunk_chars=max_chunk_chars):
+                    max_chunk_chars=max_chunk_chars, started=req_t0):
                 buf = io.BytesIO()
                 torchaudio.save(buf, audio, sr, format="wav")
                 data = buf.getvalue()
@@ -1523,7 +1662,12 @@ def tts_stream(
                 yield head.encode() + b"\n" + data
             yield (json.dumps({"done": True, "chunks": last[0],
                                "total_sec": round(last[1], 2),
-                               "seed": last[2], "spoken": body[:900]},
+                               "seed": last[2], "spoken": body[:900],
+                               # 標音層花了多久。走 LLM 而且沒命中快取時
+                               # 是 1.5–3.5 秒，那段已經含在每塊的 at 裡了，
+                               # 單獨報出來才知道錢花在哪。
+                               "annotate_sec": round(annotate_sec, 2),
+                               "annotate": note},
                               ensure_ascii=False) + "\n").encode()
         except Exception as exc:                      # 串流開始後才失敗的話，
             log.exception("stream failed")            # HTTP 狀態碼已經送出去了，
@@ -1574,6 +1718,18 @@ if admin_api.ADMIN_KEY:
     app.include_router(admin_api.router)
 else:
     log.info("ADMIN_API_KEY 未設定，/admin 維護端點不掛載")
+
+@app.get("/", include_in_schema=False)
+def index_page():
+    """試聽台首頁。
+
+    下面那個 StaticFiles 掛在 "/" 也送得出 index.html，但它只發 ETag 與
+    Last-Modified，瀏覽器會拿舊的——改了頁面卻看不到，而且看起來像沒生效。
+    /stream 與 /dicts 早就各自補了 no-cache，首頁漏了。
+    """
+    return FileResponse(STATIC_DIR / "index.html",
+                        headers={"Cache-Control": "no-cache, must-revalidate"})
+
 
 @app.get("/stream", include_in_schema=False)
 def stream_page():

@@ -79,6 +79,7 @@
   <div class="tabs">
     <button id="tab_dict" class="on">對照表</button>
     <button id="tab_sug">我的意見<span class="badge" id="sugn" hidden></span></button>
+    <button id="tab_tailo">台羅讀音（唯讀）</button>
   </div>
 
   <div id="pane_sug" hidden>
@@ -105,6 +106,30 @@
       <th style="width:110px">華語詞</th><th style="width:130px">目前的</th>
       <th style="width:90px">次數</th><th>出現在哪些句子</th>
     </tr></thead><tbody id="blamerows"></tbody></table>
+  </div>
+
+  <div id="pane_tailo" hidden>
+    <p class="hint">
+      這張表是 ChhoeTaigi 的辭典加上語料統計，<b>只給看，不提供修改</b>——改它等於改
+      別人的辭典。真正該修的是「這個詞在這句話裡該唸哪個音」，那是語料統計與
+      Gemini 在做的事，不是這張表。
+    </p>
+    <div class="bar">
+      <input id="tq" placeholder="搜尋詞或讀音（例：明天、bin5）">
+      <label class="chk">
+        <input type="checkbox" id="tmulti" checked> 只看有多種唸法的
+      </label>
+      <span class="counts" id="tcounts"></span>
+    </div>
+    <table>
+      <thead><tr><th>詞</th><th>會用的讀音</th><th>怎麼決定的</th><th>其他候選</th></tr></thead>
+      <tbody id="trows"></tbody>
+    </table>
+    <div class="page">
+      <button class="ghost" id="tprev">上一頁</button>
+      <span id="tpage"></span>
+      <button class="ghost" id="tnext">下一頁</button>
+    </div>
   </div>
 
   <div id="pane_dict">
@@ -335,13 +360,48 @@ async function loadSug() {
 
 $("showdone").onchange = loadSug;
 
+const TABS = ["dict", "sug", "tailo"];
+function pick(which) {
+  for (const t of TABS) {
+    $("tab_" + t).classList.toggle("on", t === which);
+    $("pane_" + t).hidden = t !== which;
+  }
+}
+
+let toff = 0;
+async function loadTailo() {
+  const p = new URLSearchParams({
+    q: $("tq").value.trim(), only_multi: $("tmulti").checked ? "1" : "",
+    limit: "200", offset: String(toff),
+  });
+  const d = await (await fetch("/api/tailo?" + p)).json();
+  const HOW = { corpus: "語料統計", only: "辭典只有一個", first: "辭典第一個" };
+  $("trows").innerHTML = d.rows.map(r => `
+    <tr>
+      <td>${esc(r.word)}</td>
+      <td><span class="tag2 tailo">${esc(r.reading)}</span></td>
+      <td class="samples">${HOW[r.how] || r.how}</td>
+      <td class="samples">${r.alts.map(esc).join("、") || "—"}</td>
+    </tr>`).join("") ||
+    `<tr><td colspan="4" class="samples">沒有符合的</td></tr>`;
+  $("tcounts").textContent =
+    `辭典 ${d.counts.lexicon.toLocaleString()} 詞，其中 ${d.counts.multi.toLocaleString()} 詞有多種唸法；`
+    + `語料統計涵蓋 ${d.counts.corpus.toLocaleString()} 詞`;
+  $("tpage").textContent = `${toff + 1}–${Math.min(toff + 200, d.total)} / ${d.total}`;
+  $("tprev").disabled = toff === 0;
+  $("tnext").disabled = toff + 200 >= d.total;
+}
+$("tq").addEventListener("input", () => { toff = 0; loadTailo(); });
+$("tmulti").addEventListener("change", () => { toff = 0; loadTailo(); });
+$("tprev").onclick = () => { toff = Math.max(0, toff - 200); loadTailo(); };
+$("tnext").onclick = () => { toff += 200; loadTailo(); };
+$("tab_tailo").onclick = () => { pick("tailo"); loadTailo(); };
+
 $("tab_dict").onclick = () => {
-  $("tab_dict").classList.add("on"); $("tab_sug").classList.remove("on");
-  $("pane_dict").hidden = false; $("pane_sug").hidden = true;
+  pick("dict");
 };
 $("tab_sug").onclick = () => {
-  $("tab_sug").classList.add("on"); $("tab_dict").classList.remove("on");
-  $("pane_sug").hidden = false; $("pane_dict").hidden = true;
+  pick("sug");
   loadSug();
 };
 
