@@ -70,6 +70,15 @@
   .spoken summary:hover { color: var(--ink); }
   .spoken div { margin-top: 6px; padding: 8px 11px; border-radius: 7px;
                 background: #0e1016; border: 1px solid var(--line); }
+  /* 「直接問 LLM」那兩個模式會用誰。放在標頭，一眼就看得到——換供應商是
+     伺服器端改 .env 的事，前端本來看不出來。
+     配色沿用頁面既有的 .tag.b（藍色系），不要自己另開一套。 */
+  .llmbadge { display:inline-flex; align-items:baseline; gap:8px; font-size:12px;
+              padding:3px 11px; border-radius:20px; margin-top:8px;
+              background:#232838; color:var(--accent);
+              border:1px solid #33415c; }
+  .llmbadge.off { color:var(--warn); border-color:#5c4a2a; }
+  .llmbadge small { color:var(--muted); font-size:11px; }
   audio { width: 100%; margin-top: 8px; }
   .empty { color: var(--muted); text-align: center; padding: 48px 20px; }
   .err { color: #ff8f8f; }
@@ -108,6 +117,7 @@
   <h1>CosyVoice3 台語模型試聽台</h1>
   <div class="sub" id="health">載入中…</div>
   <div class="sub"><a href="/dicts" style="color:#6ea8fe">台文對照表 →</a>　<a href="/stream" style="color:#6ea8fe">串流合成 →</a></div>
+  <div id="llmbadge"></div>
 </header>
 
 <main>
@@ -127,9 +137,9 @@
     <select id="annotate">
       <option value="none" selected>不轉換（原字送進去）</option>
       <option value="hanji">轉台文（查表）</option>
-      <option value="hanji_llm">轉台文（查表＋Gemini）</option>
+      <option value="hanji_direct">轉台文（直接問 LLM）</option>
       <option value="corpus">轉台羅（查表）</option>
-      <option value="gemini">轉台羅（查表＋Gemini 挑文白）</option>
+      <option value="tailo_direct">轉台羅（直接問 LLM）</option>
     </select>
     <label>台文對照表版本</label>
     <select id="hanji_table">
@@ -255,6 +265,7 @@ async function init() {
       fill($("hift"), v.parts.hift, start.hift || "official");
     $("instruct").value = v.default_instruct;
     DEFAULT_INSTRUCT = v.default_instruct;
+    showLlmBadge(v.llm);
     const opt = $("simplify").options;
     if (v.t2s_entries) opt[1].textContent += `（${v.t2s_entries} 字）`;
     if (v.t2s_full_entries) opt[2].textContent += `（${v.t2s_full_entries} 字）`;
@@ -590,6 +601,19 @@ $("results").addEventListener("click", e => {
 $("clear").onclick = () => { $("results").innerHTML = '<div class="empty">還沒有結果</div>'; };
 
 init();
+
+// 標出「直接問 LLM」那兩個模式會用誰。金鑰沒設就標成灰的——那時候那兩個選項
+// 會自動退回查表，畫面上要看得出來，不然只會覺得「怎麼跟查表一樣」。
+function showLlmBadge(info) {
+  const el = document.getElementById("llmbadge");
+  if (!el || !info) return;
+  const reason = info.reasoning ? `　reasoning=${info.reasoning}` : "";
+  el.innerHTML = info.ready
+    ? `<span class="llmbadge">${escapeHtml(info.provider)} · ${escapeHtml(info.model)}`
+      + `<small>${escapeHtml(reason)}</small></span>`
+    : `<span class="llmbadge off">${escapeHtml(info.provider)} · ${escapeHtml(info.model)}`
+      + `<small>　沒有金鑰，直接問 LLM 會退回查表</small></span>`;
+}
 </script>
 </body>
 </html>

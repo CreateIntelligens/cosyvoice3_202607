@@ -97,9 +97,29 @@ services:
       # loss 最低（1.352）卻連 155 字都講不完。詳見
       # reports/taigi-tailo-scaling-2026-08-20.md
       TTS_API_LLM: ${TTS_API_LLM:-llm_v7_best}
-      # 標音層的 gemini 模式要用。沒設的話那個選項會自動退回語料預設。
+      # 標音層的 LLM 模式要用。沒設的話那些選項會自動退回查表。
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
       GEMINI_MODEL: ${GEMINI_MODEL:-gemini-3.5-flash-lite}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      # 「直接問 LLM」那兩個模式用哪家、哪個模型。實測（8 句客服文字，
+      # 用臺羅音節合法率評分）：
+      #
+      #   gemini-3.7-flash        100.0%  4.43s  每次 0.134 元
+      #   gpt-5.5 / none           99.3%  2.41s  每次 0.116 元  ← 快、準、又最便宜
+      #   gpt-5.4 / none           93.6%  2.00s  每次 0.058 元
+      #   gpt-5.6-luna / none      81.1%  2.06s  每次 0.005 元
+      #   gemini-3.5-flash-lite  40–89%   1.1s   每次 0.017 元
+      #
+      # gpt-5.5 便宜是反直覺的：它單價 $5/$30 比 gemini-3.7-flash 的 $0.75/$3.75
+      # 貴六倍，但計費輸出只有 46 個 token（Gemini 要 1,034 個思考 token），
+      # 用量少 22 倍，總帳反而便宜。
+      #
+      # LLM_REASONING 只對 OpenAI 有意義，而且**一定要 none**：開了推理一律變差
+      # （luna 91%→80% 還慢五倍，gpt-5-nano 掉到 9.3%）。Gemini 相反，它的思考
+      # 正是品質來源。新版把參數值從 minimal 改名成 none，舊值會回 400。
+      LLM_PROVIDER: ${LLM_PROVIDER:-gemini}
+      LLM_MODEL: ${LLM_MODEL:-}
+      LLM_REASONING: ${LLM_REASONING:-none}
       # 未知詞、點讚點爛、LLM 補的表都寫這裡。repo 是唯讀掛載，寫不進去。
       TAIGI_DATA: /data/taigi
       # /admin 用的權杖，跟 TTS_API_KEY 分開。沒設就不掛載那組端點。
@@ -120,6 +140,10 @@ services:
       # models/ would dangle inside the container. Mount the real directory on top.
       - ${BASE_MODEL_DIR:-../../workspace/cosyvoice3_smoke_10spk/models/Fun-CosyVoice3-0.5B}:/models/base:ro
       - testbench-variants:/tmp/cosyvoice-variants
+      # wetext 的文字正規化模型（30 MB）預設下載到容器內的 /root/.cache，
+      # 每次 recreate 都會重下一次——而來源只有 282 kB/s，整整五分鐘的冷啟動
+      # 都花在這裡。掛成 volume 就只下載一次。
+      - testbench-cache:/root/.cache
       # 分層表與回饋紀錄。跟 repo 分開，重建底表不會動到這裡面的東西。
       - ./data:/data/taigi
     shm_size: "8gb"
@@ -134,3 +158,4 @@ services:
 
 volumes:
   testbench-variants:
+  testbench-cache:

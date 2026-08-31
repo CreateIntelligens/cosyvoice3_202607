@@ -58,6 +58,14 @@
   .chunk .idx { width:34px; flex:none; }
   .chunk .at { width:62px; flex:none; color:var(--ink); }
   .live { color:var(--warn); font-size:12px; }
+  /* 把「第一個音」拆成標音與合成兩段。走 LLM 的時候標音可能佔一大半，
+     混成一個數字會讓人以為是模型慢。 */
+  .split { display:flex; gap:6px; align-items:center; font-size:11px;
+           color:var(--muted); margin:-2px 0 8px; font-variant-numeric:tabular-nums; }
+  .split i { font-style:normal; height:10px; border-radius:2px; display:inline-block; }
+  .split i.a { background:#5b6ea8; }
+  .split i.b { background:#2d5548; }
+  .split .why { color:#6b7590; }
   /* 串流的聲音沒有 <audio> 可以按，控制項得自己給一個 */
   #bar { position:fixed; left:0; right:0; bottom:0; display:none; align-items:center; gap:12px;
          padding:12px 20px; background:#161922; border-top:1px solid var(--line); z-index:9; }
@@ -74,6 +82,15 @@
   main { padding-bottom:80px; }
   .spoken { margin-top:8px; font-size:12px; color:var(--muted); padding:8px 11px;
             background:#0e1016; border:1px solid var(--line); border-radius:7px; }
+  /* 「直接問 LLM」那兩個模式會用誰。放在標頭，一眼就看得到——換供應商是
+     伺服器端改 .env 的事，前端本來看不出來。
+     配色沿用頁面既有的 .tag.b（藍色系），不要自己另開一套。 */
+  .llmbadge { display:inline-flex; align-items:baseline; gap:8px; font-size:12px;
+              padding:3px 11px; border-radius:20px; margin-top:8px;
+              background:#232838; color:var(--accent);
+              border:1px solid #33415c; }
+  .llmbadge.off { color:var(--warn); border-color:#5c4a2a; }
+  .llmbadge small { color:var(--muted); font-size:11px; }
 </style>
 </head>
 <body>
@@ -82,6 +99,7 @@
   <div class="sub">
     邊生成邊播，量「多久聽得到第一個音」。<a href="/">回試聽台</a>　<a href="/dicts">台文對照表</a>
   </div>
+  <div id="llmbadge"></div>
 </header>
 
 <main>
@@ -100,7 +118,7 @@
     <select id="annotate">
       <option value="none" selected>不轉換</option>
       <option value="hanji">轉台文（查表）</option>
-      <option value="hanji_llm">轉台文（查表＋Gemini）</option>
+      <option value="hanji_direct">轉台文（直接問 LLM）</option>
     </select>
 
     <label>繁體字轉簡體字形</label>
@@ -164,6 +182,7 @@ let meta = null;
   };
   fill($("llm"), v.parts.llm, (v.startup || {}).llm || "official");
   fill($("prompt_name"), v.prompts, v.prompts[0]);
+  showLlmBadge(v.llm);
 })();
 
 // seed 的兩個操作跟試聽台一致：卡片上的 seed 點一下沿用，「隨機」按回 -1。
@@ -443,11 +462,13 @@ function newCard(snap) {
       ${snap.simplify !== "none" ? `<span class="tag">簡體:${esc(snap.simplify)}</span>` : ""}
     </div>
     <div class="ttfa waiting"><b>—</b><span>秒後聽到第一個音</span></div>
+    <div class="split" hidden></div>
     <div class="live">串流中…</div>
     <div class="chunks"></div>
     <div class="status"></div>`;
   $("results").prepend(el);
   return { el, ttfa: el.querySelector(".ttfa"), live: el.querySelector(".live"),
+           split: el.querySelector(".split"),
            chunks: el.querySelector(".chunks"), status: el.querySelector(".status") };
 }
 
@@ -473,11 +494,33 @@ function finish(card, head, blobs, t0) {
   }
   const elapsed = (performance.now() - t0) / 1000;
   const ttfa = parseFloat(card.ttfa.querySelector("b").textContent) || 0;
+  // 拆成標音與合成兩段。走 LLM 又沒命中快取時，標音可能比合成還久——
+  // 混成一個數字會讓人以為是模型慢。
+  const ann = head.annotate_sec || 0;
+  if (card.split && ttfa > 0) {
+    const w = (v) => Math.max(2, Math.round(v / ttfa * 180));
+    card.split.hidden = false;
+    // 標音那段為什麼是 0，要講清楚——走 LLM 但命中快取就沒有呼叫，
+    // 只寫「0.00s」會讓人以為時間跑到別的地方去了。
+    const note = head.annotate || "";
+    const cached = note.includes("快取");
+    const viaLlm = /openai|gemini/.test(note);
+    const why = cached ? "（快取命中，沒有呼叫 LLM）"
+              : viaLlm ? "（呼叫 LLM）"
+              : note.includes("退回") ? "（LLM 沒過驗證，已退回查表）"
+              : ann < 0.05 ? "（純查表）" : "";
+    card.split.innerHTML =
+      `<i class="a" style="width:${w(ann)}px"></i>標音 ${ann.toFixed(2)}s`
+      + `<span class="why">${esc(why)}</span>`
+      + `<i class="b" style="width:${w(ttfa - ann)}px"></i>合成 ${(ttfa - ann).toFixed(2)}s`
+      + (note ? `　<span class="why">${esc(note)}</span>` : "");
+  }
   card.el.querySelector(".tags").insertAdjacentHTML("beforeend",
     `<span class="tag hot">第一個音 ${ttfa.toFixed(2)}s</span>`
     + `<span class="tag">全部 ${elapsed.toFixed(2)}s</span>`
     + `<span class="tag">音長 ${head.total_sec}s</span>`
     + `<span class="tag">${head.chunks} 塊</span>`
+
     + `<span class="tag seed" data-seed="${head.seed}" `
     + `title="點一下沿用這個 seed">seed ${head.seed}</span>`);
   // 把所有塊接成一個檔，右邊就能重複聽。
@@ -559,6 +602,19 @@ function buildWav(parts, fmt) {
 function esc(s) {
   return String(s ?? "").replace(/[&<>"']/g,
     c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+// 標出「直接問 LLM」那兩個模式會用誰。金鑰沒設就標成灰的——那時候那兩個選項
+// 會自動退回查表，畫面上要看得出來，不然只會覺得「怎麼跟查表一樣」。
+function showLlmBadge(info) {
+  const el = document.getElementById("llmbadge");
+  if (!el || !info) return;
+  const reason = info.reasoning ? `　reasoning=${info.reasoning}` : "";
+  el.innerHTML = info.ready
+    ? `<span class="llmbadge">${esc(info.provider)} · ${esc(info.model)}`
+      + `<small>${esc(reason)}</small></span>`
+    : `<span class="llmbadge off">${esc(info.provider)} · ${esc(info.model)}`
+      + `<small>　沒有金鑰，直接問 LLM 會退回查表</small></span>`;
 }
 </script>
 </body>
